@@ -1,0 +1,6 @@
+{
+  "name": "StudyVerse",
+  "description": "A study app to host external links internally like pwthor.live",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

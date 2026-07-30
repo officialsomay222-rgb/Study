@@ -1,20 +1,18 @@
 package com.example
 
 import android.os.Bundle
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.animation.AnimatedContentTransitionScope
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -115,6 +113,11 @@ fun StudyApp() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(onNavigateToWeb: (String, String) -> Unit) {
+    var isVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        isVisible = true
+    }
+
     Scaffold(
         containerColor = Color(0xFF0F0F13),
         topBar = {
@@ -171,12 +174,20 @@ fun HomeScreen(onNavigateToWeb: (String, String) -> Unit) {
                     )
             )
 
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding)
-                    .padding(horizontal = 24.dp)
+            AnimatedVisibility(
+                visible = isVisible,
+                enter = fadeIn(animationSpec = tween(800)) + slideInVertically(
+                    initialOffsetY = { 50 },
+                    animationSpec = tween(800, easing = FastOutSlowInEasing)
+                ),
+                modifier = Modifier.fillMaxSize()
             ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                        .padding(horizontal = 24.dp)
+                ) {
                 Spacer(modifier = Modifier.height(16.dp))
                 LazyColumn(
                     modifier = Modifier.weight(1f),
@@ -187,7 +198,7 @@ fun HomeScreen(onNavigateToWeb: (String, String) -> Unit) {
                             title = "PW (Physics Wallah)",
                             description = "Access pwthor.live securely within the StudyHub encrypted webview container.",
                             icon = { Icon(Icons.Default.MenuBook, contentDescription = null, tint = Color(0xFF001D35)) },
-                            onClick = { onNavigateToWeb("https://pwthor.live", "Physics Wallah") }
+                            onClick = { onNavigateToWeb("https://pwthor.live/study/batches", "Physics Wallah") }
                         )
                     }
                     
@@ -221,16 +232,27 @@ fun HomeScreen(onNavigateToWeb: (String, String) -> Unit) {
                                 )
                             )
                     )
+                    val textColor by infiniteTransition.animateColor(
+                        initialValue = Color(0xFFE3E2E6),
+                        targetValue = Color(0xFF90CAF9),
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(1500, easing = LinearEasing),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "TextColor"
+                    )
+
                     Text(
                         text = "Made by Owner Official",
                         style = MaterialTheme.typography.labelMedium,
-                        color = Color(0xFFE3E2E6),
+                        color = textColor,
                         fontWeight = FontWeight.Bold,
                         letterSpacing = 1.2.sp,
                         textAlign = TextAlign.Center,
                     )
                 }
             }
+            } // Close AnimatedVisibility
         }
     }
 }
@@ -242,22 +264,36 @@ fun StudyAppCard(
     icon: @Composable () -> Unit,
     onClick: () -> Unit
 ) {
+    val infiniteTransition = rememberInfiniteTransition(label = "CardAura")
+    val borderAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2500, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "BorderAlpha"
+    )
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(32.dp))
             .background(
                 Brush.linearGradient(
-                    colors = listOf(Color(0xCC1E293B), Color(0xCC0F172A))
+                    colors = listOf(
+                        Color(0xFF3F51B5).copy(alpha = borderAlpha * 0.8f),
+                        Color(0xFF90CAF9).copy(alpha = borderAlpha * 0.8f)
+                    )
                 )
             )
-            .padding(1.dp) // for border
+            .padding(2.dp) // Aura border width
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(31.dp))
-                .background(Color(0x662D3A4F))
+                .clip(RoundedCornerShape(30.dp))
+                .background(Color(0xCC1E293B))
                 .clickable { onClick() }
                 .padding(24.dp)
         ) {
@@ -318,80 +354,100 @@ fun StudyAppCard(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WebViewScreen(url: String, title: String, onBack: () -> Unit) {
     var webView: WebView? by remember { mutableStateOf(null) }
+    var isLoading by remember { mutableStateOf(true) }
+    var progress by remember { mutableStateOf(0f) }
 
     // Handle back button for WebView navigation
     BackHandler(enabled = webView?.canGoBack() == true) {
         webView?.goBack()
     }
 
-    Scaffold(
-        containerColor = Color(0xFF0F0F13),
-        topBar = {
-            TopAppBar(
-                title = { 
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Medium
-                    ) 
-                },
-                navigationIcon = {
-                    IconButton(onClick = {
-                        if (webView?.canGoBack() == true) {
-                            webView?.goBack()
-                        } else {
-                            onBack()
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0F0F13))
+            .windowInsetsPadding(WindowInsets.statusBars)
+    ) {
+        AndroidView(
+            factory = { context ->
+                WebView(context).apply {
+                    layoutParams = android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        useWideViewPort = true
+                        loadWithOverviewMode = true
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        databaseEnabled = true
+                        cacheMode = WebSettings.LOAD_DEFAULT
+                        mediaPlaybackRequiresUserGesture = false
+                        setSupportZoom(true)
+                        builtInZoomControls = true
+                        displayZoomControls = false
+                    }
+                    
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                    webChromeClient = object : WebChromeClient() {
+                        override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                            progress = newProgress / 100f
+                            isLoading = newProgress < 100
                         }
-                    }) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = Color(0xFFE3E2E6)
-                        )
                     }
-                },
-                actions = {
-                    TextButton(onClick = onBack) {
-                        Text("Close", color = Color(0xFF90CAF9))
+
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            return false
+                        }
                     }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color(0xFF0F0F13),
-                    titleContentColor = Color(0xFFE3E2E6)
-                )
-            )
-        }
-    ) { innerPadding ->
-        Box(
+                    loadUrl(url)
+                    webView = this
+                }
+            },
+            update = {
+                webView = it
+            },
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding)
+                .clip(RoundedCornerShape(bottomStart = 24.dp, bottomEnd = 24.dp))
+        )
+
+        if (isLoading) {
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.TopCenter),
+                color = Color(0xFF90CAF9),
+                trackColor = Color(0x3390CAF9)
+            )
+        }
+
+        IconButton(
+            onClick = {
+                if (webView?.canGoBack() == true) {
+                    webView?.goBack()
+                } else {
+                    onBack()
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(16.dp)
+                .size(48.dp)
+                .background(Color(0x990F172A), RoundedCornerShape(percent = 50))
+                .clip(RoundedCornerShape(percent = 50))
         ) {
-            AndroidView(
-                factory = { context ->
-                    WebView(context).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        settings.useWideViewPort = true
-                        settings.loadWithOverviewMode = true
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                                // Important: return false to keep navigation inside this WebView
-                                return false
-                            }
-                        }
-                        loadUrl(url)
-                        webView = this
-                    }
-                },
-                update = {
-                    webView = it
-                },
-                modifier = Modifier.fillMaxSize()
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                contentDescription = "Back",
+                tint = Color(0xFFE3E2E6)
             )
         }
     }

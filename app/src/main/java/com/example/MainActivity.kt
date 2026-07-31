@@ -2,6 +2,7 @@ package com.example
 
 import android.app.Activity
 import android.content.Context
+import android.content.pm.ActivityInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
@@ -18,6 +19,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.runtime.SideEffect
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -75,7 +78,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MyApplicationTheme {
                 WebViewScreen(
-                    url = "https://pw-thor-two.vercel.app",
+                    url = "https://study-verse-lime.vercel.app/",
                     savedState = savedInstanceState,
                     onWebViewCreated = { webViewInstance = it }
                 )
@@ -112,6 +115,18 @@ fun WebViewScreen(
 
     val context = LocalContext.current
 
+    // Set status bar and navigation bar color to Light Blue (#0288D1)
+    SideEffect {
+        (context as? Activity)?.window?.let { window ->
+            val lightBlueColor = android.graphics.Color.parseColor("#0288D1")
+            window.statusBarColor = lightBlueColor
+            window.navigationBarColor = lightBlueColor
+            val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
+            windowInsetsController.isAppearanceLightStatusBars = false
+            windowInsetsController.isAppearanceLightNavigationBars = false
+        }
+    }
+
     // Handle system back button for custom view (full screen video) OR step-by-step internal WebView navigation
     BackHandler(enabled = customView != null || canGoBack) {
         if (customView != null) {
@@ -119,6 +134,7 @@ fun WebViewScreen(
             customView = null
             customViewCallback = null
             (context as? Activity)?.let { activity ->
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                 windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
             }
@@ -142,16 +158,24 @@ fun WebViewScreen(
             )
         }
     } else {
-        // Root container uplifted using WindowInsets.systemBars
+        // Root container with light blue status/navigation bar background
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xFF0F0F13))
+                .background(Color(0xFF0288D1))
                 .windowInsetsPadding(WindowInsets.systemBars)
         ) {
             AndroidView(
                 factory = { ctx ->
-                    WebView(ctx).apply {
+                    val swipeRefreshLayout = SwipeRefreshLayout(ctx).apply {
+                        setColorSchemeColors(
+                            android.graphics.Color.parseColor("#0288D1"),
+                            android.graphics.Color.parseColor("#00BCD4")
+                        )
+                        setProgressBackgroundColorSchemeColor(android.graphics.Color.parseColor("#1E293B"))
+                    }
+
+                    val webViewInstance = WebView(ctx).apply {
                         layoutParams = android.view.ViewGroup.LayoutParams(
                             android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                             android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -192,6 +216,7 @@ fun WebViewScreen(
                                 progress = newProgress / 100f
                                 if (newProgress >= 95) {
                                     isLoading = false
+                                    swipeRefreshLayout.isRefreshing = false
                                 }
                                 canGoBack = view?.canGoBack() == true
                             }
@@ -237,6 +262,7 @@ fun WebViewScreen(
                                 customViewCallback = callback
 
                                 (ctx as? Activity)?.let { activity ->
+                                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                                     val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                                     windowInsetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                                     windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
@@ -249,6 +275,7 @@ fun WebViewScreen(
                                 customViewCallback = null
 
                                 (ctx as? Activity)?.let { activity ->
+                                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                                     val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                                     windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
                                 }
@@ -293,6 +320,7 @@ fun WebViewScreen(
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
                                 isLoading = false
+                                swipeRefreshLayout.isRefreshing = false
                                 canGoBack = view?.canGoBack() == true
                             }
 
@@ -302,6 +330,7 @@ fun WebViewScreen(
                                 error: WebResourceError?
                             ) {
                                 super.onReceivedError(view, request, error)
+                                swipeRefreshLayout.isRefreshing = false
                                 if (request?.isForMainFrame == true) {
                                     if (!isNetworkAvailable(ctx)) {
                                         hasError = true
@@ -320,10 +349,28 @@ fun WebViewScreen(
                         webView = this
                         onWebViewCreated(this)
                     }
+
+                    swipeRefreshLayout.addView(
+                        webViewInstance,
+                        android.view.ViewGroup.LayoutParams(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                    )
+
+                    swipeRefreshLayout.setOnRefreshListener {
+                        hasError = false
+                        webViewInstance.reload()
+                    }
+
+                    swipeRefreshLayout
                 },
-                update = {
-                    webView = it
-                    canGoBack = it.canGoBack()
+                update = { container ->
+                    val childWebView = container.getChildAt(0) as? WebView
+                    if (childWebView != null) {
+                        webView = childWebView
+                        canGoBack = childWebView.canGoBack()
+                    }
                 },
                 modifier = Modifier.fillMaxSize()
             )

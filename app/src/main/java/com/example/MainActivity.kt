@@ -130,7 +130,7 @@ fun WebViewScreen(
             customView = null
             customViewCallback = null
             (context as? Activity)?.let { activity ->
-                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                 windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
             }
@@ -234,15 +234,8 @@ fun WebViewScreen(
                             allowFileAccess = true
                             allowContentAccess = true
 
-                            // Hide WebView identifier to prevent some sites from blocking it
-                            userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
-
                             // Offline caching & speed optimization
-                            cacheMode = if (isNetworkAvailable(ctx)) {
-                                WebSettings.LOAD_DEFAULT
-                            } else {
-                                WebSettings.LOAD_CACHE_ELSE_NETWORK
-                            }
+                            cacheMode = WebSettings.LOAD_DEFAULT
                         }
                         
                         CookieManager.getInstance().setAcceptCookie(true)
@@ -284,7 +277,7 @@ fun WebViewScreen(
                                 customViewCallback = null
 
                                 (ctx as? Activity)?.let { activity ->
-                                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                                     val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                                     windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
                                 }
@@ -388,12 +381,6 @@ fun WebViewScreen(
                                 
                                 view?.evaluateJavascript("""
                                     (function() {
-                                        // Force all links to open in the same tab
-                                        var links = document.querySelectorAll('a[target="_blank"]');
-                                        for (var i = 0; i < links.length; i++) {
-                                            links[i].removeAttribute('target');
-                                        }
-
                                         function sendColor() {
                                             var metaThemeColor = document.querySelector('meta[name="theme-color"]');
                                             if (metaThemeColor && metaThemeColor.content) {
@@ -412,10 +399,12 @@ fun WebViewScreen(
                                             }
                                         }
                                         sendColor();
-                                        // Also observe changes in case of dynamic themes or dark mode toggles
-                                        var observer = new MutationObserver(sendColor);
+                                        // Observe DOM for dynamic themes or dark mode toggles
+                                        var observer = new MutationObserver(function() {
+                                            sendColor();
+                                        });
                                         observer.observe(document.head, { childList: true, subtree: true, attributes: true });
-                                        observer.observe(document.body, { attributes: true, attributeFilter: ['style', 'class'] });
+                                        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
                                     })();
                                 """.trimIndent(), null)
                             }

@@ -97,6 +97,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// Outside composable, or just define it as a class accepting a lambda
+class WebAppInterface(private val onColorReceived: (String) -> Unit) {
+    @android.webkit.JavascriptInterface
+    fun postThemeColor(colorString: String) {
+        onColorReceived(colorString)
+    }
+}
+
 @Composable
 fun WebViewScreen(
     url: String,
@@ -115,18 +123,6 @@ fun WebViewScreen(
 
     val context = LocalContext.current
 
-    // Set status bar and navigation bar color to Light Blue (#0288D1)
-    SideEffect {
-        (context as? Activity)?.window?.let { window ->
-            val lightBlueColor = android.graphics.Color.parseColor("#0288D1")
-            window.statusBarColor = lightBlueColor
-            window.navigationBarColor = lightBlueColor
-            val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
-            windowInsetsController.isAppearanceLightStatusBars = false
-            windowInsetsController.isAppearanceLightNavigationBars = false
-        }
-    }
-
     // Handle system back button for custom view (full screen video) OR step-by-step internal WebView navigation
     BackHandler(enabled = customView != null || canGoBack) {
         if (customView != null) {
@@ -134,7 +130,7 @@ fun WebViewScreen(
             customView = null
             customViewCallback = null
             (context as? Activity)?.let { activity ->
-                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                 windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
             }
@@ -158,14 +154,42 @@ fun WebViewScreen(
             )
         }
     } else {
-        // Root container with light blue status/navigation bar background
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color(0xFF0288D1))
-                .windowInsetsPadding(WindowInsets.systemBars)
-        ) {
-            AndroidView(
+        // Root container with dynamically updated background
+        var themeColor by remember { mutableStateOf(android.graphics.Color.parseColor("#0288D1")) }
+        
+        SideEffect {
+            (context as? Activity)?.window?.let { window ->
+                window.statusBarColor = themeColor
+                window.navigationBarColor = themeColor
+                val isLight = (android.graphics.Color.red(themeColor) * 0.299 +
+                        android.graphics.Color.green(themeColor) * 0.587 +
+                        android.graphics.Color.blue(themeColor) * 0.114) > 186
+                val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
+                windowInsetsController.isAppearanceLightStatusBars = isLight
+                windowInsetsController.isAppearanceLightNavigationBars = isLight
+            }
+        }
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(themeColor))
+                    .windowInsetsPadding(WindowInsets.systemBars)
+            ) {
+                // Top Loading Progress Bar
+                if (isLoading && progress < 1f) {
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(4.dp),
+                        color = Color(0xFFF44336),
+                        trackColor = Color.Transparent
+                    )
+                }
+
+                AndroidView(
                 factory = { ctx ->
                     val swipeRefreshLayout = SwipeRefreshLayout(ctx).apply {
                         setColorSchemeColors(
@@ -176,6 +200,16 @@ fun WebViewScreen(
                     }
 
                     val webViewInstance = WebView(ctx).apply {
+                        val jsInterface = WebAppInterface { colorStr ->
+                            try {
+                                val parsed = android.graphics.Color.parseColor(colorStr)
+                                (ctx as? Activity)?.runOnUiThread {
+                                    themeColor = parsed
+                                }
+                            } catch (e: Exception) { e.printStackTrace() }
+                        }
+                        addJavascriptInterface(jsInterface, "AndroidInterface")
+                        
                         layoutParams = android.view.ViewGroup.LayoutParams(
                             android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                             android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -196,9 +230,12 @@ fun WebViewScreen(
                             builtInZoomControls = true
                             displayZoomControls = false
                             javaScriptCanOpenWindowsAutomatically = true
-                            setSupportMultipleWindows(true)
+                            setSupportMultipleWindows(false)
                             allowFileAccess = true
                             allowContentAccess = true
+
+                            // Hide WebView identifier to prevent some sites from blocking it
+                            userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
 
                             // Offline caching & speed optimization
                             cacheMode = if (isNetworkAvailable(ctx)) {
@@ -225,34 +262,6 @@ fun WebViewScreen(
                                 request?.grant(request.resources)
                             }
 
-                            override fun onCreateWindow(
-                                view: WebView?,
-                                isDialog: Boolean,
-                                isUserGesture: Boolean,
-                                resultMsg: android.os.Message?
-                            ): Boolean {
-                                val result = view?.hitTestResult
-                                val data = result?.extra
-                                if (data != null) {
-                                    view.loadUrl(data)
-                                    return true
-                                }
-                                val newWebView = WebView(ctx)
-                                newWebView.webViewClient = object : WebViewClient() {
-                                    override fun shouldOverrideUrlLoading(
-                                        newView: WebView?,
-                                        request: WebResourceRequest?
-                                    ): Boolean {
-                                        view?.loadUrl(request?.url.toString())
-                                        return true
-                                    }
-                                }
-                                val transport = resultMsg?.obj as? WebView.WebViewTransport
-                                transport?.webView = newWebView
-                                resultMsg?.sendToTarget()
-                                return true
-                            }
-
                             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
                                 if (customView != null) {
                                     callback?.onCustomViewHidden()
@@ -275,7 +284,7 @@ fun WebViewScreen(
                                 customViewCallback = null
 
                                 (ctx as? Activity)?.let { activity ->
-                                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                                     val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                                     windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
                                 }
@@ -289,9 +298,33 @@ fun WebViewScreen(
                                     return false // Let WebView handle it normally
                                 }
                                 try {
-                                    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(requestUrl))
+                                    val intent = if (requestUrl.startsWith("intent://")) {
+                                        android.content.Intent.parseUri(requestUrl, android.content.Intent.URI_INTENT_SCHEME)
+                                    } else {
+                                        android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(requestUrl))
+                                    }
+                                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                                     ctx.startActivity(intent)
                                 } catch (e: Exception) {
+                                    if (requestUrl.startsWith("intent://")) {
+                                        try {
+                                            val parsedIntent = android.content.Intent.parseUri(requestUrl, android.content.Intent.URI_INTENT_SCHEME)
+                                            val fallbackUrl = parsedIntent.getStringExtra("browser_fallback_url")
+                                            if (fallbackUrl != null) {
+                                                view?.loadUrl(fallbackUrl)
+                                                return true
+                                            }
+                                            val packageName = parsedIntent.`package`
+                                            if (packageName != null) {
+                                                val playStoreIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("market://details?id=$packageName"))
+                                                playStoreIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                ctx.startActivity(playStoreIntent)
+                                                return true
+                                            }
+                                        } catch (ex: Exception) {
+                                            ex.printStackTrace()
+                                        }
+                                    }
                                     e.printStackTrace()
                                 }
                                 return true
@@ -304,9 +337,33 @@ fun WebViewScreen(
                                     return false // Let WebView handle it normally
                                 }
                                 try {
-                                    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(urlStr))
+                                    val intent = if (urlStr.startsWith("intent://")) {
+                                        android.content.Intent.parseUri(urlStr, android.content.Intent.URI_INTENT_SCHEME)
+                                    } else {
+                                        android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(urlStr))
+                                    }
+                                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                                     ctx.startActivity(intent)
                                 } catch (e: Exception) {
+                                    if (urlStr.startsWith("intent://")) {
+                                        try {
+                                            val parsedIntent = android.content.Intent.parseUri(urlStr, android.content.Intent.URI_INTENT_SCHEME)
+                                            val fallbackUrl = parsedIntent.getStringExtra("browser_fallback_url")
+                                            if (fallbackUrl != null) {
+                                                view?.loadUrl(fallbackUrl)
+                                                return true
+                                            }
+                                            val packageName = parsedIntent.`package`
+                                            if (packageName != null) {
+                                                val playStoreIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("market://details?id=$packageName"))
+                                                playStoreIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                ctx.startActivity(playStoreIntent)
+                                                return true
+                                            }
+                                        } catch (ex: Exception) {
+                                            ex.printStackTrace()
+                                        }
+                                    }
                                     e.printStackTrace()
                                 }
                                 return true
@@ -317,11 +374,50 @@ fun WebViewScreen(
                                 canGoBack = view?.canGoBack() == true
                             }
 
+                            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                                super.onPageStarted(view, url, favicon)
+                                isLoading = true
+                                progress = 0f
+                            }
+
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
                                 isLoading = false
                                 swipeRefreshLayout.isRefreshing = false
                                 canGoBack = view?.canGoBack() == true
+                                
+                                view?.evaluateJavascript("""
+                                    (function() {
+                                        // Force all links to open in the same tab
+                                        var links = document.querySelectorAll('a[target="_blank"]');
+                                        for (var i = 0; i < links.length; i++) {
+                                            links[i].removeAttribute('target');
+                                        }
+
+                                        function sendColor() {
+                                            var metaThemeColor = document.querySelector('meta[name="theme-color"]');
+                                            if (metaThemeColor && metaThemeColor.content) {
+                                                window.AndroidInterface.postThemeColor(metaThemeColor.content);
+                                            } else {
+                                                var bgColor = window.getComputedStyle(document.body).backgroundColor;
+                                                if (bgColor && bgColor.startsWith('rgb')) {
+                                                    var match = bgColor.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                                                    if (match) {
+                                                        var r = parseInt(match[1]).toString(16).padStart(2, '0');
+                                                        var g = parseInt(match[2]).toString(16).padStart(2, '0');
+                                                        var b = parseInt(match[3]).toString(16).padStart(2, '0');
+                                                        window.AndroidInterface.postThemeColor('#' + r + g + b);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        sendColor();
+                                        // Also observe changes in case of dynamic themes or dark mode toggles
+                                        var observer = new MutationObserver(sendColor);
+                                        observer.observe(document.head, { childList: true, subtree: true, attributes: true });
+                                        observer.observe(document.body, { attributes: true, attributeFilter: ['style', 'class'] });
+                                    })();
+                                """.trimIndent(), null)
                             }
 
                             override fun onReceivedError(
@@ -332,16 +428,23 @@ fun WebViewScreen(
                                 super.onReceivedError(view, request, error)
                                 swipeRefreshLayout.isRefreshing = false
                                 if (request?.isForMainFrame == true) {
-                                    if (!isNetworkAvailable(ctx)) {
-                                        hasError = true
-                                        errorMessage = "No internet connection available. Please check your network."
+                                    val errorCode = error?.errorCode ?: 0
+                                    // -10 is ERROR_UNSUPPORTED_SCHEME. Don't show error screen for deep links.
+                                    if (errorCode != WebViewClient.ERROR_UNSUPPORTED_SCHEME && errorCode != -10) {
+                                        if (!isNetworkAvailable(ctx)) {
+                                            hasError = true
+                                            errorMessage = "No internet connection available. Please check your network."
+                                        } else {
+                                            // Don't eagerly show error page for other network issues unless it's a real DNS/Timeout failure,
+                                            // but since we want to be less aggressive, let WebView handle its own errors when online.
+                                        }
                                     }
                                 }
                             }
                         }
 
                         if (savedState != null) {
-                            restoreState(savedState)
+                            this.restoreState(savedState)
                         } else {
                             loadUrl(url)
                         }
@@ -372,8 +475,9 @@ fun WebViewScreen(
                         canGoBack = childWebView.canGoBack()
                     }
                 },
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier.fillMaxWidth().weight(1f)
             )
+            } // Close Column
 
             // Error / Offline Screen Overlay
             if (hasError) {

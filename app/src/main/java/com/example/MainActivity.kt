@@ -379,7 +379,26 @@ fun WebViewScreen(
                                 newWebView.webViewClient = object : WebViewClient() {
                                     override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
                                         val targetUrl = req?.url?.toString() ?: return false
-                                        view.loadUrl(targetUrl)
+                                        if (targetUrl.endsWith(".pdf", ignoreCase = true) || 
+                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("docs.google.com"))) {
+                                            val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(targetUrl, "UTF-8")}"
+                                            view.loadUrl(googlePdfUrl)
+                                        } else {
+                                            view.loadUrl(targetUrl)
+                                        }
+                                        return true
+                                    }
+                                    
+                                    @Suppress("DEPRECATION")
+                                    override fun shouldOverrideUrlLoading(v: WebView?, urlStr: String?): Boolean {
+                                        val targetUrl = urlStr ?: return false
+                                        if (targetUrl.endsWith(".pdf", ignoreCase = true) || 
+                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("docs.google.com"))) {
+                                            val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(targetUrl, "UTF-8")}"
+                                            view.loadUrl(googlePdfUrl)
+                                        } else {
+                                            view.loadUrl(targetUrl)
+                                        }
                                         return true
                                     }
                                 }
@@ -530,6 +549,7 @@ fun WebViewScreen(
                                 super.doUpdateVisitedHistory(view, url, isReload)
                                 canGoBack = view?.canGoBack() == true
                                 if (url != null) currentLoadedUrl = url
+                                swipeRefreshLayout.isEnabled = url?.contains("docs.google.com/gview") != true
                             }
 
                             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -537,6 +557,7 @@ fun WebViewScreen(
                                 isLoading = true
                                 progress = 0f
                                 if (url != null) currentLoadedUrl = url
+                                swipeRefreshLayout.isEnabled = url?.contains("docs.google.com/gview") != true
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
@@ -545,6 +566,21 @@ fun WebViewScreen(
                                 swipeRefreshLayout.isRefreshing = false
                                 canGoBack = view?.canGoBack() == true
                                 if (url != null) currentLoadedUrl = url
+                                swipeRefreshLayout.isEnabled = url?.contains("docs.google.com/gview") != true
+                                
+                                if (url != null && url.contains("docs.google.com/gview")) {
+                                    view?.evaluateJavascript("""
+                                        (function() {
+                                            var meta = document.querySelector('meta[name="viewport"]');
+                                            if (!meta) {
+                                                meta = document.createElement('meta');
+                                                meta.name = 'viewport';
+                                                document.head.appendChild(meta);
+                                            }
+                                            meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes';
+                                        })();
+                                    """.trimIndent(), null)
+                                }
                                 
                                 view?.evaluateJavascript("""
                                     (function() {

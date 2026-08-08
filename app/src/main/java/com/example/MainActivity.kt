@@ -84,6 +84,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         enableEdgeToEdge()
         setContent {
             MyApplicationTheme {
@@ -215,8 +216,14 @@ fun WebViewScreen(
         
         SideEffect {
             (context as? Activity)?.window?.let { window ->
-                window.statusBarColor = themeColor
-                window.navigationBarColor = themeColor
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                if (isInitialLink) {
+                    window.statusBarColor = android.graphics.Color.TRANSPARENT
+                    window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                } else {
+                    window.statusBarColor = themeColor
+                    window.navigationBarColor = themeColor
+                }
                 val isLight = (android.graphics.Color.red(themeColor) * 0.299 +
                         android.graphics.Color.green(themeColor) * 0.587 +
                         android.graphics.Color.blue(themeColor) * 0.114) > 186
@@ -302,21 +309,46 @@ fun WebViewScreen(
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                         setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, contentLength ->
-                            val fileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
+                            var rawFileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
+                            val isPdf = (mimeType?.contains("pdf", ignoreCase = true) == true) ||
+                                        (downloadUrl.contains(".pdf", ignoreCase = true)) ||
+                                        (contentDisposition?.contains(".pdf", ignoreCase = true) == true) ||
+                                        rawFileName.endsWith(".pdf", ignoreCase = true)
+
+                            val finalFileName = if (isPdf || rawFileName.endsWith(".bin", ignoreCase = true)) {
+                                when {
+                                    rawFileName.endsWith(".bin", ignoreCase = true) -> rawFileName.substringBeforeLast(".bin") + ".pdf"
+                                    !rawFileName.endsWith(".pdf", ignoreCase = true) -> {
+                                        if (rawFileName.contains(".")) rawFileName.substringBeforeLast(".") + ".pdf" else "$rawFileName.pdf"
+                                    }
+                                    else -> rawFileName
+                                }
+                            } else {
+                                rawFileName
+                            }
+
+                            val finalMimeType = if (isPdf || finalFileName.endsWith(".pdf", ignoreCase = true)) "application/pdf" else (if (mimeType.isNullOrEmpty()) "application/octet-stream" else mimeType)
+
                             try {
                                 val request = DownloadManager.Request(android.net.Uri.parse(downloadUrl)).apply {
-                                    setMimeType(if (mimeType.isNullOrEmpty()) "application/pdf" else mimeType)
+                                    setMimeType(finalMimeType)
                                     addRequestHeader("User-Agent", userAgent)
                                     val cookie = CookieManager.getInstance().getCookie(downloadUrl)
                                     if (cookie != null) addRequestHeader("Cookie", cookie)
-                                    setTitle(fileName)
-                                    setDescription("Downloading $fileName...")
+                                    setTitle("StudyVerse: $finalFileName")
+                                    setDescription("Downloading $finalFileName...")
                                     setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, finalFileName)
                                 }
                                 val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
                                 dm?.enqueue(request)
-                                Toast.makeText(ctx, "Downloading $fileName to Gallery/Downloads...", Toast.LENGTH_LONG).show()
+                                Toast.makeText(ctx, "StudyVerse: Downloading $finalFileName to Downloads...", Toast.LENGTH_LONG).show()
+
+                                // Load PDF in in-app web browser view
+                                if (isPdf || finalFileName.endsWith(".pdf", ignoreCase = true)) {
+                                    val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(downloadUrl, "UTF-8")}"
+                                    this.loadUrl(googlePdfUrl)
+                                }
                             } catch (e: Exception) {
                                 e.printStackTrace()
                                 Toast.makeText(ctx, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()

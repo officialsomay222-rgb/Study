@@ -1,20 +1,28 @@
 package com.example
 
 import android.app.Activity
+import android.app.DownloadManager
 import android.content.Context
 import android.content.pm.ActivityInfo
+import android.graphics.BitmapFactory
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
+import android.os.Environment
 import android.view.View
 import android.webkit.CookieManager
 import android.webkit.PermissionRequest
+import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -65,6 +73,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.launch
+import java.io.File
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -97,6 +107,36 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+fun setupStudyVerseMediaSession(context: Context): MediaSession? {
+    return try {
+        val bitmap = BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher)
+        MediaSession(context, "StudyVerseMedia").apply {
+            val metadata = MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, "StudyVerse")
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, "StudyVerse Learning Platform")
+                .putString(MediaMetadata.METADATA_KEY_ALBUM, "StudyVerse Audio")
+                .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bitmap)
+                .putBitmap(MediaMetadata.METADATA_KEY_ART, bitmap)
+                .build()
+            setMetadata(metadata)
+            setPlaybackState(
+                PlaybackState.Builder()
+                    .setActions(
+                        PlaybackState.ACTION_PLAY or
+                        PlaybackState.ACTION_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE
+                    )
+                    .setState(PlaybackState.STATE_PLAYING, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f)
+                    .build()
+            )
+            isActive = true
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
+
 // Outside composable, or just define it as a class accepting a lambda
 class WebAppInterface(private val onColorReceived: (String) -> Unit) {
     @android.webkit.JavascriptInterface
@@ -117,11 +157,27 @@ fun WebViewScreen(
     var progress by remember { mutableStateOf(0f) }
     var hasError by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
+    var currentLoadedUrl by remember { mutableStateOf(url) }
     
     var customView by remember { mutableStateOf<View?>(null) }
     var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
 
+    val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
+
+    DisposableEffect(context) {
+        val mediaSession = setupStudyVerseMediaSession(context)
+        onDispose {
+            try {
+                mediaSession?.isActive = false
+                mediaSession?.release()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    val isInitialLink = !canGoBack || currentLoadedUrl.contains("study-verse-lime.vercel.app")
 
     // Handle system back button for custom view (full screen video) OR step-by-step internal WebView navigation
     BackHandler(enabled = customView != null || canGoBack) {
@@ -130,7 +186,7 @@ fun WebViewScreen(
             customView = null
             customViewCallback = null
             (context as? Activity)?.let { activity ->
-                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_USER
                 val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                 windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
             }
@@ -175,7 +231,9 @@ fun WebViewScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(Color(themeColor))
-                    .windowInsetsPadding(WindowInsets.systemBars)
+                    .then(
+                        if (isInitialLink) Modifier else Modifier.windowInsetsPadding(WindowInsets.systemBars)
+                    )
             ) {
                 // Top Loading Progress Bar
                 if (isLoading && progress < 1f) {
@@ -230,9 +288,11 @@ fun WebViewScreen(
                             builtInZoomControls = true
                             displayZoomControls = false
                             javaScriptCanOpenWindowsAutomatically = true
-                            setSupportMultipleWindows(false)
+                            setSupportMultipleWindows(true)
                             allowFileAccess = true
                             allowContentAccess = true
+
+                            userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
 
                             // Offline caching & speed optimization
                             cacheMode = WebSettings.LOAD_DEFAULT
@@ -240,6 +300,28 @@ fun WebViewScreen(
                         
                         CookieManager.getInstance().setAcceptCookie(true)
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                        setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, contentLength ->
+                            val fileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
+                            try {
+                                val request = DownloadManager.Request(android.net.Uri.parse(downloadUrl)).apply {
+                                    setMimeType(if (mimeType.isNullOrEmpty()) "application/pdf" else mimeType)
+                                    addRequestHeader("User-Agent", userAgent)
+                                    val cookie = CookieManager.getInstance().getCookie(downloadUrl)
+                                    if (cookie != null) addRequestHeader("Cookie", cookie)
+                                    setTitle(fileName)
+                                    setDescription("Downloading $fileName...")
+                                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                                }
+                                val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+                                dm?.enqueue(request)
+                                Toast.makeText(ctx, "Downloading $fileName to Gallery/Downloads...", Toast.LENGTH_LONG).show()
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                Toast.makeText(ctx, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
 
                         webChromeClient = object : WebChromeClient() {
                             override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -249,6 +331,30 @@ fun WebViewScreen(
                                     swipeRefreshLayout.isRefreshing = false
                                 }
                                 canGoBack = view?.canGoBack() == true
+                            }
+
+                            override fun onCreateWindow(
+                                view: WebView?,
+                                isDialog: Boolean,
+                                isUserGesture: Boolean,
+                                resultMsg: android.os.Message?
+                            ): Boolean {
+                                val newWebView = WebView(view!!.context)
+                                newWebView.settings.javaScriptEnabled = true
+                                newWebView.settings.domStorageEnabled = true
+                                newWebView.settings.userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                                newWebView.webChromeClient = this
+                                newWebView.webViewClient = object : WebViewClient() {
+                                    override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
+                                        val targetUrl = req?.url?.toString() ?: return false
+                                        view.loadUrl(targetUrl)
+                                        return true
+                                    }
+                                }
+                                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                                transport?.webView = newWebView
+                                resultMsg?.sendToTarget()
+                                return true
                             }
 
                             override fun onPermissionRequest(request: PermissionRequest?) {
@@ -277,7 +383,7 @@ fun WebViewScreen(
                                 customViewCallback = null
 
                                 (ctx as? Activity)?.let { activity ->
-                                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                                    activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_USER
                                     val windowInsetsController = WindowCompat.getInsetsController(activity.window, activity.window.decorView)
                                     windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
                                 }
@@ -285,8 +391,25 @@ fun WebViewScreen(
                         }
 
                         webViewClient = object : WebViewClient() {
+                            override fun onReceivedSslError(
+                                view: WebView?,
+                                handler: android.webkit.SslErrorHandler?,
+                                error: android.net.http.SslError?
+                            ) {
+                                handler?.proceed()
+                            }
+
                             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                                 val requestUrl = request?.url?.toString() ?: return false
+                                currentLoadedUrl = requestUrl
+
+                                if (requestUrl.endsWith(".pdf", ignoreCase = true) || 
+                                    (requestUrl.contains(".pdf", ignoreCase = true) && !requestUrl.contains("docs.google.com"))) {
+                                    val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(requestUrl, "UTF-8")}"
+                                    view?.loadUrl(googlePdfUrl)
+                                    return true
+                                }
+
                                 if (requestUrl.startsWith("http://") || requestUrl.startsWith("https://")) {
                                     return false // Let WebView handle it normally
                                 }
@@ -326,6 +449,15 @@ fun WebViewScreen(
                             @Suppress("DEPRECATION")
                             override fun shouldOverrideUrlLoading(view: WebView?, urlStr: String?): Boolean {
                                 if (urlStr == null) return false
+                                currentLoadedUrl = urlStr
+
+                                if (urlStr.endsWith(".pdf", ignoreCase = true) || 
+                                    (urlStr.contains(".pdf", ignoreCase = true) && !urlStr.contains("docs.google.com"))) {
+                                    val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(urlStr, "UTF-8")}"
+                                    view?.loadUrl(googlePdfUrl)
+                                    return true
+                                }
+
                                 if (urlStr.startsWith("http://") || urlStr.startsWith("https://")) {
                                     return false // Let WebView handle it normally
                                 }
@@ -365,12 +497,14 @@ fun WebViewScreen(
                             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                                 super.doUpdateVisitedHistory(view, url, isReload)
                                 canGoBack = view?.canGoBack() == true
+                                if (url != null) currentLoadedUrl = url
                             }
 
                             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                                 super.onPageStarted(view, url, favicon)
                                 isLoading = true
                                 progress = 0f
+                                if (url != null) currentLoadedUrl = url
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
@@ -378,6 +512,7 @@ fun WebViewScreen(
                                 isLoading = false
                                 swipeRefreshLayout.isRefreshing = false
                                 canGoBack = view?.canGoBack() == true
+                                if (url != null) currentLoadedUrl = url
                                 
                                 view?.evaluateJavascript("""
                                     (function() {
@@ -424,8 +559,7 @@ fun WebViewScreen(
                                             hasError = true
                                             errorMessage = "No internet connection available. Please check your network."
                                         } else {
-                                            // Don't eagerly show error page for other network issues unless it's a real DNS/Timeout failure,
-                                            // but since we want to be less aggressive, let WebView handle its own errors when online.
+                                            // Don't eagerly show error page for other network issues unless it's a real DNS/Timeout failure
                                         }
                                     }
                                 }

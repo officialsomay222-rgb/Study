@@ -49,6 +49,8 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.School
 import androidx.compose.material.icons.filled.SignalWifiOff
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -302,7 +304,8 @@ fun WebViewScreen(
                             userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
 
                             // Offline caching & speed optimization
-                            cacheMode = WebSettings.LOAD_DEFAULT
+                            cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
+                            loadsImagesAutomatically = true
                         }
                         
                         CookieManager.getInstance().setAcceptCookie(true)
@@ -665,10 +668,67 @@ fun WebViewScreen(
                         webView = childWebView
                         canGoBack = childWebView.canGoBack()
                     }
+                    container.isEnabled = !currentLoadedUrl.contains("docs.google.com/gview")
                 },
                 modifier = Modifier.fillMaxWidth().weight(1f)
             )
             } // Close Column
+
+            // PDF Menu Overlay
+            if (currentLoadedUrl.contains("docs.google.com/gview")) {
+                var menuExpanded by remember { mutableStateOf(false) }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .windowInsetsPadding(WindowInsets.systemBars)
+                        .padding(8.dp),
+                    contentAlignment = Alignment.TopEnd
+                ) {
+                    Box {
+                        IconButton(
+                            onClick = { menuExpanded = true },
+                            modifier = Modifier
+                                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.9f), CircleShape)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "More Options",
+                                tint = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = menuExpanded,
+                            onDismissRequest = { menuExpanded = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Download PDF") },
+                                onClick = {
+                                    menuExpanded = false
+                                    val uri = android.net.Uri.parse(currentLoadedUrl)
+                                    val originalUrl = uri.getQueryParameter("url")
+                                    if (originalUrl != null) {
+                                        val guessName = URLUtil.guessFileName(originalUrl, null, "application/pdf")
+                                        val finalName = if (guessName.endsWith(".pdf", true)) guessName else "$guessName.pdf"
+                                        val request = DownloadManager.Request(android.net.Uri.parse(originalUrl)).apply {
+                                            setMimeType("application/pdf")
+                                            setTitle("StudyVerse: $finalName")
+                                            setDescription("Downloading $finalName...")
+                                            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, finalName)
+                                        }
+                                        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+                                        dm?.enqueue(request)
+                                        Toast.makeText(context, "Downloading $finalName...", Toast.LENGTH_LONG).show()
+                                    }
+                                },
+                                leadingIcon = {
+                                    Icon(imageVector = Icons.Default.Download, contentDescription = null)
+                                }
+                            )
+                        }
+                    }
+                }
+            }
 
             // Error / Offline Screen Overlay
             if (hasError) {

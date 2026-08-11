@@ -241,22 +241,8 @@ fun WebViewScreen(
         }
     }
 
-    if (customView != null) {
-        // Immersive Full Screen Video Overlay
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black),
-            contentAlignment = Alignment.Center
-        ) {
-            AndroidView(
-                factory = { customView!! },
-                modifier = Modifier.fillMaxSize()
-            )
-        }
-    } else {
-        // Root container with dynamically updated background
-        var themeColor by remember { mutableStateOf(android.graphics.Color.parseColor("#0288D1")) }
+    // Root container with dynamically updated background
+    var themeColor by remember { mutableStateOf(android.graphics.Color.parseColor("#0288D1")) }
         
         SideEffect {
             (context as? Activity)?.window?.let { window ->
@@ -326,6 +312,9 @@ fun WebViewScreen(
                         
                         // Hardware Acceleration for smooth 60fps rendering
                         setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                            setRendererPriorityPolicy(android.webkit.WebView.RENDERER_PRIORITY_BOUND, true)
+                        }
 
                         settings.apply {
                             javaScriptEnabled = true
@@ -419,9 +408,31 @@ fun WebViewScreen(
                                 resultMsg: android.os.Message?
                             ): Boolean {
                                 val newWebView = WebView(view!!.context)
-                                newWebView.settings.javaScriptEnabled = true
-                                newWebView.settings.domStorageEnabled = true
-                                newWebView.settings.userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                                newWebView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                    newWebView.setRendererPriorityPolicy(android.webkit.WebView.RENDERER_PRIORITY_BOUND, true)
+                                }
+                                newWebView.settings.apply {
+                                    javaScriptEnabled = true
+                                    domStorageEnabled = true
+                                    @Suppress("DEPRECATION")
+                                    databaseEnabled = true
+                                    useWideViewPort = true
+                                    loadWithOverviewMode = true
+                                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                                    mediaPlaybackRequiresUserGesture = false
+                                    setSupportZoom(true)
+                                    builtInZoomControls = true
+                                    displayZoomControls = false
+                                    javaScriptCanOpenWindowsAutomatically = true
+                                    setSupportMultipleWindows(true)
+                                    allowFileAccess = true
+                                    allowContentAccess = true
+                                    setGeolocationEnabled(true)
+                                    cacheMode = WebSettings.LOAD_DEFAULT
+                                    loadsImagesAutomatically = true
+                                    userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                                }
                                 newWebView.webChromeClient = this
                                 newWebView.webViewClient = object : WebViewClient() {
                                     override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
@@ -842,9 +853,43 @@ fun WebViewScreen(
             ) {
                 LoadingOverlay(progress = progress)
             }
+            
+            if (customView != null) {
+                // Immersive Full Screen Video Overlay
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    AndroidView(
+                        factory = { ctx ->
+                            android.widget.FrameLayout(ctx).apply {
+                                layoutParams = android.view.ViewGroup.LayoutParams(
+                                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                    android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                                )
+                                setBackgroundColor(android.graphics.Color.BLACK)
+                                
+                                customView?.let { cv ->
+                                    (cv.parent as? android.view.ViewGroup)?.removeView(cv)
+                                    addView(cv, android.widget.FrameLayout.LayoutParams(
+                                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                                        android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                                        android.view.Gravity.CENTER
+                                    ))
+                                }
+                            }
+                        },
+                        onRelease = { container ->
+                            container.removeAllViews()
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+            }
         }
     }
-}
 
 @Composable
 fun LoadingOverlay(progress: Float) {

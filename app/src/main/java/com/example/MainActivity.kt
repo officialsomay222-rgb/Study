@@ -23,6 +23,9 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import com.google.firebase.Firebase
+import com.google.firebase.remoteconfig.remoteConfig
+import com.google.firebase.remoteconfig.remoteConfigSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -168,6 +171,45 @@ fun WebViewScreen(
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
 
+    LaunchedEffect(webView) {
+        if (webView != null) {
+            try {
+                val remoteConfig = Firebase.remoteConfig
+                val configSettings = remoteConfigSettings {
+                    minimumFetchIntervalInSeconds = 3600
+                }
+                remoteConfig.setConfigSettingsAsync(configSettings)
+                remoteConfig.fetchAndActivate().addOnCompleteListener { task ->
+                    if (task.isSuccessful) {
+                        try {
+                            val customUserAgent = remoteConfig.getString("webview_user_agent")
+                            if (customUserAgent.isNotEmpty()) {
+                                webView?.settings?.userAgentString = customUserAgent
+                            }
+                            
+                            if (remoteConfig.all.containsKey("webview_cache_mode")) {
+                                webView?.settings?.cacheMode = remoteConfig.getLong("webview_cache_mode").toInt()
+                            }
+                            
+                            if (remoteConfig.all.containsKey("webview_java_script_enabled")) {
+                                webView?.settings?.javaScriptEnabled = remoteConfig.getBoolean("webview_java_script_enabled")
+                            }
+                            
+                            if (remoteConfig.all.containsKey("webview_dom_storage_enabled")) {
+                                webView?.settings?.domStorageEnabled = remoteConfig.getBoolean("webview_dom_storage_enabled")
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Firebase might not be initialized if google-services.json is missing
+                e.printStackTrace()
+            }
+        }
+    }
+
     DisposableEffect(context) {
         val mediaSession = setupStudyVerseMediaSession(context)
         onDispose {
@@ -288,6 +330,7 @@ fun WebViewScreen(
                         settings.apply {
                             javaScriptEnabled = true
                             domStorageEnabled = true
+                            @Suppress("DEPRECATION")
                             databaseEnabled = true
                             useWideViewPort = true
                             loadWithOverviewMode = true
@@ -300,11 +343,12 @@ fun WebViewScreen(
                             setSupportMultipleWindows(true)
                             allowFileAccess = true
                             allowContentAccess = true
+                            setGeolocationEnabled(true)
 
                             userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
 
                             // Offline caching & speed optimization
-                            cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
+                            cacheMode = WebSettings.LOAD_DEFAULT
                             loadsImagesAutomatically = true
                         }
                         
@@ -657,6 +701,7 @@ fun WebViewScreen(
 
                     swipeRefreshLayout.setOnRefreshListener {
                         hasError = false
+                        webViewInstance.clearCache(true)
                         webViewInstance.reload()
                     }
 
@@ -669,6 +714,14 @@ fun WebViewScreen(
                         canGoBack = childWebView.canGoBack()
                     }
                     container.isEnabled = !currentLoadedUrl.contains("docs.google.com/gview")
+                },
+                onRelease = { container ->
+                    val childWebView = container.getChildAt(0) as? WebView
+                    childWebView?.let {
+                        it.stopLoading()
+                        it.removeAllViews()
+                        it.destroy()
+                    }
                 },
                 modifier = Modifier.fillMaxWidth().weight(1f)
             )

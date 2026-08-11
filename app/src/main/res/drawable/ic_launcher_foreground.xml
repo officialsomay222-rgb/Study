@@ -3,32 +3,21 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+    
     <group
-        android:scaleX="3.0"
-        android:scaleY="3.0"
-        android:translateX="18"
-        android:translateY="18">
-        <!-- Graduation Cap Top -->
+        android:scaleX="2.8"
+        android:scaleY="2.8"
+        android:translateX="20"
+        android:translateY="20">
+        <!-- Sleek minimalist book / graduation cap logo -->
+        <!-- Core Cap Top -->
         <path
-            android:fillColor="#FFFFFF"
-            android:pathData="M12,2L1,7l11,5l11,-5L12,2z M5.18,7L12,3.9L18.82,7L12,10.1L5.18,7z" />
+            android:fillColor="#38BDF8"
+            android:pathData="M12 3L1 9L12 15L21 10.09V17H23V9M5 13.18V17.18L12 21L19 17.18V13.18L12 17L5 13.18Z" />
+        <!-- Subtle Glow/Highlight overlay -->
         <path
-            android:fillColor="#E0F7FA"
-            android:pathData="M12,4.2L6.8,7L12,9.8L17.2,7L12,4.2z" />
-        <!-- Cap Side & Tassel -->
-        <path
-            android:fillColor="#80DEEA"
-            android:pathData="M5,8.8v4.2l7,3.8l7,-3.8V8.8l-7,3.8L5,8.8z" />
-        <!-- Open Book -->
-        <path
-            android:fillColor="#FFFFFF"
-            android:pathData="M12,17c-2.5,-1 -5.5,-1 -8,-1v6c2.5,0 5.5,0 8,1c2.5,-1 5.5,-1 8,-1v-6c-2.5,0 -5.5,0 -8,1z" />
-        <path
-            android:fillColor="#B2EBF2"
-            android:pathData="M11,18c-2,-0.8 -4.5,-0.8 -6.5,-0.8v4.5c2,0 4.5,0 6.5,0.8V18z M13,18v4.5c2,-0.8 4.5,-0.8 6.5,-0.8V17.2c-2,0 -4.5,0 -6.5,0.8z" />
-        <!-- Sparkle Star -->
-        <path
-            android:fillColor="#FFF59D"
-            android:pathData="M21,3l0.6,1.4L23,5l-1.4,0.6L21,7l-0.6,-1.4L19,5l1.4,-0.6z" />
+            android:fillColor="#7DD3FC"
+            android:pathData="M12 3L1 9L12 11.5L23 9L12 3Z"
+            android:fillAlpha="0.3" />
     </group>
 </vector>

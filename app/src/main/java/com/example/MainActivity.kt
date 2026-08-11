@@ -168,6 +168,27 @@ fun WebViewScreen(
     var customView by remember { mutableStateOf<View?>(null) }
     var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
 
+    var fileChooserCallback by remember { mutableStateOf<android.webkit.ValueCallback<Array<android.net.Uri>>?>(null) }
+    val fileChooserLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            val data = result.data
+            val uris = if (data?.data != null) {
+                arrayOf(data.data!!)
+            } else if (data?.clipData != null) {
+                val clipData = data.clipData!!
+                Array(clipData.itemCount) { i -> clipData.getItemAt(i).uri }
+            } else {
+                null
+            }
+            fileChooserCallback?.onReceiveValue(uris)
+        } else {
+            fileChooserCallback?.onReceiveValue(null)
+        }
+        fileChooserCallback = null
+    }
+
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
 
@@ -392,6 +413,26 @@ fun WebViewScreen(
                         }
 
                         webChromeClient = object : WebChromeClient() {
+                            override fun onShowFileChooser(
+                                webView: WebView?,
+                                filePathCallback: android.webkit.ValueCallback<Array<android.net.Uri>>?,
+                                fileChooserParams: WebChromeClient.FileChooserParams?
+                            ): Boolean {
+                                fileChooserCallback?.onReceiveValue(null)
+                                fileChooserCallback = filePathCallback
+                                val intent = fileChooserParams?.createIntent()
+                                try {
+                                    if (intent != null) {
+                                        fileChooserLauncher.launch(intent)
+                                    }
+                                } catch (e: Exception) {
+                                    fileChooserCallback?.onReceiveValue(null)
+                                    fileChooserCallback = null
+                                    return false
+                                }
+                                return true
+                            }
+
                             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                                 progress = newProgress / 100f
                                 if (newProgress >= 95) {

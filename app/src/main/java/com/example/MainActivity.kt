@@ -23,6 +23,10 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import com.example.ui.pdf.PdfViewerScreen
+import com.example.ui.pdf.LiquidGlassButton
+import com.example.ui.offline.OfflineHubScreen
+import com.example.util.NetworkMonitor
 import com.google.firebase.Firebase
 import com.google.firebase.remoteconfig.remoteConfig
 import com.google.firebase.remoteconfig.remoteConfigSettings
@@ -144,10 +148,30 @@ fun setupStudyVerseMediaSession(context: Context): MediaSession? {
 }
 
 // Outside composable, or just define it as a class accepting a lambda
-class WebAppInterface(private val onColorReceived: (String) -> Unit) {
+class WebAppInterface(
+    private val onColorReceived: (String) -> Unit,
+    private val onSettingsUpdateReceived: (String) -> Unit = {},
+    private val onChunkLoadErrorReceived: (String) -> Unit = {},
+    private val onBlankContentReceived: () -> Unit = {}
+) {
     @android.webkit.JavascriptInterface
     fun postThemeColor(colorString: String) {
         onColorReceived(colorString)
+    }
+
+    @android.webkit.JavascriptInterface
+    fun updateSettings(settingsJson: String) {
+        onSettingsUpdateReceived(settingsJson)
+    }
+
+    @android.webkit.JavascriptInterface
+    fun onChunkLoadError(errorDetails: String) {
+        onChunkLoadErrorReceived(errorDetails)
+    }
+
+    @android.webkit.JavascriptInterface
+    fun onBlankContent() {
+        onBlankContentReceived()
     }
 }
 
@@ -164,6 +188,14 @@ fun WebViewScreen(
     var hasError by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
     var currentLoadedUrl by remember { mutableStateOf(url) }
+    var isPullToRefreshRuleEnabled by remember { mutableStateOf(true) }
+
+    // Inbuilt PDF Opener State
+    var activePdfSource by remember { mutableStateOf<String?>(null) }
+    var activePdfTitle by remember { mutableStateOf<String?>(null) }
+
+    // Site redeployment / white screen cache-busting recovery
+    var lastSiteUpdateRecovery by remember { mutableStateOf(0L) }
     
     var customView by remember { mutableStateOf<View?>(null) }
     var customViewCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
@@ -191,6 +223,23 @@ fun WebViewScreen(
 
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
+    val isOnline by NetworkMonitor.observeNetwork(context).collectAsState(initial = NetworkMonitor.isOnline(context))
+
+    fun triggerSiteUpdateRecovery(reason: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastSiteUpdateRecovery > 7000) {
+            lastSiteUpdateRecovery = now
+            coroutineScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+                Toast.makeText(context, "StudyVerse updated! Refreshing latest version...", Toast.LENGTH_SHORT).show()
+                webView?.clearCache(true)
+                webView?.settings?.cacheMode = WebSettings.LOAD_NO_CACHE
+                webView?.reload()
+                webView?.postDelayed({
+                    webView?.settings?.cacheMode = if (isOnline) WebSettings.LOAD_DEFAULT else WebSettings.LOAD_CACHE_ELSE_NETWORK
+                }, 4000)
+            }
+        }
+    }
 
     LaunchedEffect(webView) {
         if (webView != null) {
@@ -245,9 +294,25 @@ fun WebViewScreen(
 
     val isInitialLink = !canGoBack || currentLoadedUrl.contains("study-verse-lime.vercel.app")
 
-    // Handle system back button for custom view (full screen video) OR step-by-step internal WebView navigation
-    BackHandler(enabled = customView != null || canGoBack) {
-        if (customView != null) {
+    LaunchedEffect(isOnline) {
+        webView?.settings?.cacheMode = if (isOnline) {
+            WebSettings.LOAD_DEFAULT
+        } else {
+            WebSettings.LOAD_CACHE_ELSE_NETWORK
+        }
+        if (isOnline && hasError) {
+            hasError = false
+            isLoading = true
+            webView?.reload()
+        }
+    }
+
+    // Handle system back button for PDF viewer OR custom view (full screen video) OR step-by-step internal WebView navigation
+    BackHandler(enabled = activePdfSource != null || customView != null || canGoBack) {
+        if (activePdfSource != null) {
+            activePdfSource = null
+            activePdfTitle = null
+        } else if (customView != null) {
             customViewCallback?.onCustomViewHidden()
             customView = null
             customViewCallback = null
@@ -307,23 +372,168 @@ fun WebViewScreen(
 
                 AndroidView(
                 factory = { ctx ->
+                    val density = ctx.resources.displayMetrics.density
                     val swipeRefreshLayout = SwipeRefreshLayout(ctx).apply {
                         setColorSchemeColors(
                             android.graphics.Color.parseColor("#0288D1"),
                             android.graphics.Color.parseColor("#00BCD4")
                         )
                         setProgressBackgroundColorSchemeColor(android.graphics.Color.parseColor("#1E293B"))
+                        // Require a deliberate pull distance (140dp) to prevent accidental trigger on upward scrolls
+                        setDistanceToTriggerSync((140 * density).toInt())
+                        setSlingshotDistance((160 * density).toInt())
+                    }
+
+                    fun applyDynamicSettings(targetUrl: String?, webView: WebView) {
+                        if (targetUrl == null) return
+                        try {
+                            val prefs = ctx.getSharedPreferences("StudyVersePrefs", Context.MODE_PRIVATE)
+                            val rulesJsonStr = prefs.getString("domain_rules", "{}")
+                            val rulesJson = org.json.JSONObject(rulesJsonStr ?: "{}")
+                            
+                            var zoom = true
+                            var pullToRefresh = true
+                            var desktop = false
+                            var jsEnabled = true
+                            var domStorage = true
+                            var allowAutoPlay = false
+                            var hardwareAccel = true
+                            var allowMixedContent = true
+                            
+                            // Check defaults
+                            if (rulesJson.has("default")) {
+                                val def = rulesJson.getJSONObject("default")
+                                if (def.has("zoomEnabled")) zoom = def.getBoolean("zoomEnabled")
+                                if (def.has("pullToRefresh")) pullToRefresh = def.getBoolean("pullToRefresh")
+                                if (def.has("desktopMode")) desktop = def.getBoolean("desktopMode")
+                                if (def.has("jsEnabled")) jsEnabled = def.getBoolean("jsEnabled")
+                                if (def.has("domStorage")) domStorage = def.getBoolean("domStorage")
+                                if (def.has("allowAutoPlay")) allowAutoPlay = def.getBoolean("allowAutoPlay")
+                                if (def.has("hardwareAccel")) hardwareAccel = def.getBoolean("hardwareAccel")
+                                if (def.has("allowMixedContent")) allowMixedContent = def.getBoolean("allowMixedContent")
+                            }
+                            
+                            // Check specific domains
+                            val host = android.net.Uri.parse(targetUrl).host ?: ""
+                            if (rulesJson.has("domains")) {
+                                val domains = rulesJson.getJSONObject("domains")
+                                val keys = domains.keys()
+                                while (keys.hasNext()) {
+                                    val key = keys.next()
+                                    if (host.contains(key, ignoreCase = true)) {
+                                        val domainRules = domains.getJSONObject(key)
+                                        if (domainRules.has("zoomEnabled")) zoom = domainRules.getBoolean("zoomEnabled")
+                                        if (domainRules.has("pullToRefresh")) pullToRefresh = domainRules.getBoolean("pullToRefresh")
+                                        if (domainRules.has("desktopMode")) desktop = domainRules.getBoolean("desktopMode")
+                                        if (domainRules.has("jsEnabled")) jsEnabled = domainRules.getBoolean("jsEnabled")
+                                        if (domainRules.has("domStorage")) domStorage = domainRules.getBoolean("domStorage")
+                                        if (domainRules.has("allowAutoPlay")) allowAutoPlay = domainRules.getBoolean("allowAutoPlay")
+                                        if (domainRules.has("hardwareAccel")) hardwareAccel = domainRules.getBoolean("hardwareAccel")
+                                        if (domainRules.has("allowMixedContent")) allowMixedContent = domainRules.getBoolean("allowMixedContent")
+                                        break
+                                    }
+                                }
+                            }
+                            
+                            // Apply settings
+                            webView.settings.setSupportZoom(zoom)
+                            webView.settings.builtInZoomControls = zoom
+                            webView.settings.javaScriptEnabled = jsEnabled
+                            webView.settings.domStorageEnabled = domStorage
+                            webView.settings.mediaPlaybackRequiresUserGesture = !allowAutoPlay
+                            webView.settings.mixedContentMode = if (allowMixedContent) android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW else android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                            
+                            if (hardwareAccel) {
+                                webView.setLayerType(android.view.View.LAYER_TYPE_NONE, null)
+                            } else {
+                                webView.setLayerType(android.view.View.LAYER_TYPE_SOFTWARE, null)
+                            }
+                            
+                            if (desktop) {
+                                webView.settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+                                webView.settings.loadWithOverviewMode = true
+                                webView.settings.useWideViewPort = true
+                            } else {
+                                webView.settings.userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                            }
+                            
+                            val isAllowed = pullToRefresh && activePdfSource == null
+                            isPullToRefreshRuleEnabled = isAllowed
+                            swipeRefreshLayout.isEnabled = isAllowed
+                            
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                            // Safe fallbacks
+                            webView.settings.setSupportZoom(true)
+                            webView.settings.builtInZoomControls = true
+                            webView.settings.javaScriptEnabled = true
+                            webView.settings.domStorageEnabled = true
+                            webView.settings.mediaPlaybackRequiresUserGesture = true
+                            webView.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            webView.setLayerType(android.view.View.LAYER_TYPE_NONE, null)
+                            webView.settings.userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                            val isAllowed = activePdfSource == null
+                            isPullToRefreshRuleEnabled = isAllowed
+                            swipeRefreshLayout.isEnabled = isAllowed
+                        }
                     }
 
                     val webViewInstance = WebView(ctx).apply {
-                        val jsInterface = WebAppInterface { colorStr ->
-                            try {
-                                val parsed = android.graphics.Color.parseColor(colorStr)
+                        val jsInterface = WebAppInterface(
+                            onColorReceived = { colorStr ->
+                                try {
+                                    val parsed = android.graphics.Color.parseColor(colorStr)
+                                    (ctx as? Activity)?.runOnUiThread {
+                                        themeColor = parsed
+                                    }
+                                } catch (e: Exception) { e.printStackTrace() }
+                            },
+                            onSettingsUpdateReceived = { jsonStr ->
                                 (ctx as? Activity)?.runOnUiThread {
-                                    themeColor = parsed
+                                    try {
+                                        val prefs = ctx.getSharedPreferences("StudyVersePrefs", Context.MODE_PRIVATE)
+                                        val oldRulesStr = prefs.getString("domain_rules", "{}")
+                                        val oldRules = org.json.JSONObject(oldRulesStr ?: "{}")
+                                        val newRules = org.json.JSONObject(jsonStr)
+                                        
+                                        // Smart Merge 'default'
+                                        if (newRules.has("default")) {
+                                            oldRules.put("default", newRules.getJSONObject("default"))
+                                        }
+                                        
+                                        // Smart Merge 'domains'
+                                        if (newRules.has("domains")) {
+                                            val newDomains = newRules.getJSONObject("domains")
+                                            val oldDomains = if (oldRules.has("domains")) oldRules.getJSONObject("domains") else org.json.JSONObject()
+                                            
+                                            val keys = newDomains.keys()
+                                            while (keys.hasNext()) {
+                                                val key = keys.next()
+                                                oldDomains.put(key, newDomains.getJSONObject(key))
+                                            }
+                                            oldRules.put("domains", oldDomains)
+                                        }
+                                        
+                                        prefs.edit().putString("domain_rules", oldRules.toString()).apply()
+                                        
+                                        applyDynamicSettings(this.url, this)
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
                                 }
-                            } catch (e: Exception) { e.printStackTrace() }
-                        }
+                            },
+                            onChunkLoadErrorReceived = { errorDetails ->
+                                (ctx as? Activity)?.runOnUiThread {
+                                    triggerSiteUpdateRecovery("chunk_error: $errorDetails")
+                                }
+                            },
+                            onBlankContentReceived = {
+                                (ctx as? Activity)?.runOnUiThread {
+                                    triggerSiteUpdateRecovery("blank_body")
+                                }
+                            }
+                        )
+                        addJavascriptInterface(jsInterface, "AndroidApp")
                         addJavascriptInterface(jsInterface, "AndroidInterface")
                         
                         layoutParams = android.view.ViewGroup.LayoutParams(
@@ -331,11 +541,11 @@ fun WebViewScreen(
                             android.view.ViewGroup.LayoutParams.MATCH_PARENT
                         )
                         
-                        // Hardware Acceleration for smooth 60fps rendering
-                        setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                            setRendererPriorityPolicy(android.webkit.WebView.RENDERER_PRIORITY_BOUND, true)
-                        }
+                        // Native hardware-accelerated direct rendering (avoids offscreen buffer MESA issues)
+                        setLayerType(View.LAYER_TYPE_NONE, null)
+                        overScrollMode = View.OVER_SCROLL_NEVER
+                        isVerticalScrollBarEnabled = false
+                        isHorizontalScrollBarEnabled = false
 
                         settings.apply {
                             javaScriptEnabled = true
@@ -357,9 +567,12 @@ fun WebViewScreen(
 
                             userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
 
-                            // Offline caching & speed optimization
-                            cacheMode = WebSettings.LOAD_DEFAULT
+                            // High-speed caching & smooth scrolling optimization: fallback to cache when offline
+                            cacheMode = if (isOnline) WebSettings.LOAD_DEFAULT else WebSettings.LOAD_CACHE_ELSE_NETWORK
                             loadsImagesAutomatically = true
+                            offscreenPreRaster = true
+                            @Suppress("DEPRECATION")
+                            setRenderPriority(WebSettings.RenderPriority.HIGH)
                         }
                         
                         CookieManager.getInstance().setAcceptCookie(true)
@@ -401,10 +614,12 @@ fun WebViewScreen(
                                 dm?.enqueue(request)
                                 Toast.makeText(ctx, "StudyVerse: Downloading $finalFileName to Downloads...", Toast.LENGTH_LONG).show()
 
-                                // Load PDF in in-app web browser view
+                                // Load PDF in inbuilt PDF viewer with Liquid Glass UI
                                 if (isPdf || finalFileName.endsWith(".pdf", ignoreCase = true)) {
-                                    val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(downloadUrl, "UTF-8")}"
-                                    this.loadUrl(googlePdfUrl)
+                                    (ctx as? Activity)?.runOnUiThread {
+                                        activePdfSource = downloadUrl
+                                        activePdfTitle = finalFileName
+                                    }
                                 }
                             } catch (e: Exception) {
                                 e.printStackTrace()
@@ -449,10 +664,7 @@ fun WebViewScreen(
                                 resultMsg: android.os.Message?
                             ): Boolean {
                                 val newWebView = WebView(view!!.context)
-                                newWebView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                                    newWebView.setRendererPriorityPolicy(android.webkit.WebView.RENDERER_PRIORITY_BOUND, true)
-                                }
+                                newWebView.setLayerType(View.LAYER_TYPE_NONE, null)
                                 newWebView.settings.apply {
                                     javaScriptEnabled = true
                                     domStorageEnabled = true
@@ -479,9 +691,11 @@ fun WebViewScreen(
                                     override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
                                         val targetUrl = req?.url?.toString() ?: return false
                                         if (targetUrl.endsWith(".pdf", ignoreCase = true) || 
-                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("docs.google.com"))) {
-                                            val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(targetUrl, "UTF-8")}"
-                                            view.loadUrl(googlePdfUrl)
+                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("html"))) {
+                                            (ctx as? Activity)?.runOnUiThread {
+                                                activePdfSource = targetUrl
+                                                activePdfTitle = URLUtil.guessFileName(targetUrl, null, "application/pdf")
+                                            }
                                         } else {
                                             view.loadUrl(targetUrl)
                                         }
@@ -492,9 +706,11 @@ fun WebViewScreen(
                                     override fun shouldOverrideUrlLoading(v: WebView?, urlStr: String?): Boolean {
                                         val targetUrl = urlStr ?: return false
                                         if (targetUrl.endsWith(".pdf", ignoreCase = true) || 
-                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("docs.google.com"))) {
-                                            val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(targetUrl, "UTF-8")}"
-                                            view.loadUrl(googlePdfUrl)
+                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("html"))) {
+                                            (ctx as? Activity)?.runOnUiThread {
+                                                activePdfSource = targetUrl
+                                                activePdfTitle = URLUtil.guessFileName(targetUrl, null, "application/pdf")
+                                            }
                                         } else {
                                             view.loadUrl(targetUrl)
                                         }
@@ -554,9 +770,12 @@ fun WebViewScreen(
                                 currentLoadedUrl = requestUrl
 
                                 if (requestUrl.endsWith(".pdf", ignoreCase = true) || 
-                                    (requestUrl.contains(".pdf", ignoreCase = true) && !requestUrl.contains("docs.google.com"))) {
-                                    val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(requestUrl, "UTF-8")}"
-                                    view?.loadUrl(googlePdfUrl)
+                                    (requestUrl.contains(".pdf", ignoreCase = true) && !requestUrl.contains("html"))) {
+                                    val guessName = URLUtil.guessFileName(requestUrl, null, "application/pdf")
+                                    (ctx as? Activity)?.runOnUiThread {
+                                        activePdfSource = requestUrl
+                                        activePdfTitle = guessName
+                                    }
                                     return true
                                 }
 
@@ -602,9 +821,12 @@ fun WebViewScreen(
                                 currentLoadedUrl = urlStr
 
                                 if (urlStr.endsWith(".pdf", ignoreCase = true) || 
-                                    (urlStr.contains(".pdf", ignoreCase = true) && !urlStr.contains("docs.google.com"))) {
-                                    val googlePdfUrl = "https://docs.google.com/gview?embedded=true&url=${java.net.URLEncoder.encode(urlStr, "UTF-8")}"
-                                    view?.loadUrl(googlePdfUrl)
+                                    (urlStr.contains(".pdf", ignoreCase = true) && !urlStr.contains("html"))) {
+                                    val guessName = URLUtil.guessFileName(urlStr, null, "application/pdf")
+                                    (ctx as? Activity)?.runOnUiThread {
+                                        activePdfSource = urlStr
+                                        activePdfTitle = guessName
+                                    }
                                     return true
                                 }
 
@@ -648,7 +870,9 @@ fun WebViewScreen(
                                 super.doUpdateVisitedHistory(view, url, isReload)
                                 canGoBack = view?.canGoBack() == true
                                 if (url != null) currentLoadedUrl = url
-                                swipeRefreshLayout.isEnabled = url?.contains("docs.google.com/gview") != true
+                                view?.let { webView ->
+                                    applyDynamicSettings(url, webView)
+                                }
                             }
 
                             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -656,7 +880,37 @@ fun WebViewScreen(
                                 isLoading = true
                                 progress = 0f
                                 if (url != null) currentLoadedUrl = url
-                                swipeRefreshLayout.isEnabled = url?.contains("docs.google.com/gview") != true
+                                
+                                view?.let { webView ->
+                                    applyDynamicSettings(url, webView)
+                                }
+
+                                // Install runtime ChunkLoadError listener early
+                                view?.evaluateJavascript("""
+                                    (function() {
+                                        if (window.__studyverse_safety_guard_installed) return;
+                                        window.__studyverse_safety_guard_installed = true;
+                                        window.addEventListener('error', function(e) {
+                                            var msg = (e && e.message) ? e.message : '';
+                                            if (msg.indexOf('Loading chunk') !== -1 || 
+                                                msg.indexOf('ChunkLoadError') !== -1 || 
+                                                msg.indexOf('Failed to fetch dynamically imported module') !== -1 ||
+                                                msg.indexOf('css chunk') !== -1) {
+                                                if (window.AndroidApp && window.AndroidApp.onChunkLoadError) {
+                                                    window.AndroidApp.onChunkLoadError(msg);
+                                                }
+                                            }
+                                        }, true);
+                                        window.addEventListener('unhandledrejection', function(e) {
+                                            var reason = (e && e.reason && e.reason.message) ? e.reason.message : '';
+                                            if (reason.indexOf('Chunk') !== -1 || reason.indexOf('module') !== -1) {
+                                                if (window.AndroidApp && window.AndroidApp.onChunkLoadError) {
+                                                    window.AndroidApp.onChunkLoadError(reason);
+                                                }
+                                            }
+                                        });
+                                    })();
+                                """.trimIndent(), null)
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
@@ -665,22 +919,8 @@ fun WebViewScreen(
                                 swipeRefreshLayout.isRefreshing = false
                                 canGoBack = view?.canGoBack() == true
                                 if (url != null) currentLoadedUrl = url
-                                swipeRefreshLayout.isEnabled = url?.contains("docs.google.com/gview") != true
                                 
-                                if (url != null && url.contains("docs.google.com/gview")) {
-                                    view?.evaluateJavascript("""
-                                        (function() {
-                                            var meta = document.querySelector('meta[name="viewport"]');
-                                            if (!meta) {
-                                                meta = document.createElement('meta');
-                                                meta.name = 'viewport';
-                                                document.head.appendChild(meta);
-                                            }
-                                            meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes';
-                                        })();
-                                    """.trimIndent(), null)
-                                }
-                                
+                                // Send theme color to match system bars
                                 view?.evaluateJavascript("""
                                     (function() {
                                         function sendColor() {
@@ -701,7 +941,6 @@ fun WebViewScreen(
                                             }
                                         }
                                         sendColor();
-                                        // Observe DOM for dynamic themes or dark mode toggles
                                         var observer = new MutationObserver(function() {
                                             sendColor();
                                         });
@@ -709,6 +948,44 @@ fun WebViewScreen(
                                         observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'class'] });
                                     })();
                                 """.trimIndent(), null)
+
+                                // White screen / React blank body crash safety check after 1.5s
+                                view?.postDelayed({
+                                    if (!hasError && !isLoading) {
+                                        view.evaluateJavascript("""
+                                            (function() {
+                                                var body = document.body;
+                                                if (!body) return 'BLANK';
+                                                var text = (body.innerText || '').trim();
+                                                var elems = body.children.length;
+                                                if (elems === 0 || (text.length === 0 && body.querySelectorAll('img, svg, canvas, iframe, button, a').length === 0)) {
+                                                    return 'BLANK';
+                                                }
+                                                return 'OK';
+                                            })();
+                                        """.trimIndent()) { result ->
+                                            if (result != null && result.contains("BLANK")) {
+                                                triggerSiteUpdateRecovery("blank_body_after_load")
+                                            }
+                                        }
+                                    }
+                                }, 1500)
+                            }
+
+                            override fun onReceivedHttpError(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                                errorResponse: android.webkit.WebResourceResponse?
+                            ) {
+                                super.onReceivedHttpError(view, request, errorResponse)
+                                val reqUrl = request?.url?.toString() ?: ""
+                                val status = errorResponse?.statusCode ?: 0
+                                // 404 on JS or CSS chunks means the site was updated with new hashed bundles
+                                if (status == 404 && (reqUrl.contains("/_next/static/") || reqUrl.contains(".chunk.js") || reqUrl.contains(".chunk.css"))) {
+                                    view?.post {
+                                        triggerSiteUpdateRecovery("http_404_chunk: $reqUrl")
+                                    }
+                                }
                             }
 
                             override fun onReceivedError(
@@ -720,13 +997,17 @@ fun WebViewScreen(
                                 swipeRefreshLayout.isRefreshing = false
                                 if (request?.isForMainFrame == true) {
                                     val errorCode = error?.errorCode ?: 0
-                                    // -10 is ERROR_UNSUPPORTED_SCHEME. Don't show error screen for deep links.
                                     if (errorCode != WebViewClient.ERROR_UNSUPPORTED_SCHEME && errorCode != -10) {
-                                        if (!isNetworkAvailable(ctx)) {
+                                        if (!NetworkMonitor.isOnline(ctx)) {
                                             hasError = true
-                                            errorMessage = "No internet connection available. Please check your network."
+                                            errorMessage = "No internet connection available. Offline mode active."
                                         } else {
-                                            // Don't eagerly show error page for other network issues unless it's a real DNS/Timeout failure
+                                            if (errorCode == WebViewClient.ERROR_HOST_LOOKUP || 
+                                                errorCode == WebViewClient.ERROR_CONNECT || 
+                                                errorCode == WebViewClient.ERROR_TIMEOUT) {
+                                                hasError = true
+                                                errorMessage = "Unable to connect to StudyVerse. Please check your network."
+                                            }
                                         }
                                     }
                                 }
@@ -751,9 +1032,21 @@ fun WebViewScreen(
                         )
                     )
 
+                    // Strict Child Scroll Up Callback:
+                    // Return true if child can scroll up, which blocks SwipeRefreshLayout from intercepting touches.
+                    // SwipeRefresh is only permitted if WebView is stationary at the true top (scrollY <= 0) AND cannot scroll up (-1).
+                    swipeRefreshLayout.setOnChildScrollUpCallback { _, _ ->
+                        val child = swipeRefreshLayout.getChildAt(0) as? WebView
+                        if (child == null) {
+                            false
+                        } else {
+                            child.scrollY > 0 || child.canScrollVertically(-1)
+                        }
+                    }
+
                     swipeRefreshLayout.setOnRefreshListener {
                         hasError = false
-                        webViewInstance.clearCache(true)
+                        // Do NOT clearCache(true); fast reload revalidates assets without heavy redownloads
                         webViewInstance.reload()
                     }
 
@@ -765,7 +1058,7 @@ fun WebViewScreen(
                         webView = childWebView
                         canGoBack = childWebView.canGoBack()
                     }
-                    container.isEnabled = !currentLoadedUrl.contains("docs.google.com/gview")
+                    container.isEnabled = isPullToRefreshRuleEnabled && activePdfSource == null
                 },
                 onRelease = { container ->
                     val childWebView = container.getChildAt(0) as? WebView
@@ -779,118 +1072,71 @@ fun WebViewScreen(
             )
             } // Close Column
 
-            // PDF Menu Overlay
-            if (currentLoadedUrl.contains("docs.google.com/gview")) {
-                var menuExpanded by remember { mutableStateOf(false) }
+            // Offline Mode Banner when browsing cached content
+            if (!isOnline && !hasError && activePdfSource == null) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .windowInsetsPadding(WindowInsets.systemBars)
-                        .padding(8.dp),
-                    contentAlignment = Alignment.TopEnd
+                        .windowInsetsPadding(WindowInsets.statusBars)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    contentAlignment = Alignment.TopCenter
                 ) {
-                    Box {
-                        IconButton(
-                            onClick = { menuExpanded = true },
-                            modifier = Modifier
-                                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.9f), CircleShape)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.MoreVert,
-                                contentDescription = "More Options",
-                                tint = MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-                        DropdownMenu(
-                            expanded = menuExpanded,
-                            onDismissRequest = { menuExpanded = false }
-                        ) {
-                            DropdownMenuItem(
-                                text = { Text("Download PDF") },
-                                onClick = {
-                                    menuExpanded = false
-                                    val uri = android.net.Uri.parse(currentLoadedUrl)
-                                    val originalUrl = uri.getQueryParameter("url")
-                                    if (originalUrl != null) {
-                                        val guessName = URLUtil.guessFileName(originalUrl, null, "application/pdf")
-                                        val finalName = if (guessName.endsWith(".pdf", true)) guessName else "$guessName.pdf"
-                                        val request = DownloadManager.Request(android.net.Uri.parse(originalUrl)).apply {
-                                            setMimeType("application/pdf")
-                                            setTitle("StudyVerse: $finalName")
-                                            setDescription("Downloading $finalName...")
-                                            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, finalName)
-                                        }
-                                        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
-                                        dm?.enqueue(request)
-                                        Toast.makeText(context, "Downloading $finalName...", Toast.LENGTH_LONG).show()
-                                    }
-                                },
-                                leadingIcon = {
-                                    Icon(imageVector = Icons.Default.Download, contentDescription = null)
-                                }
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Error / Offline Screen Overlay
-            if (hasError) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color(0xFF0F0F13))
-                        .padding(24.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SignalWifiOff,
-                            contentDescription = "Offline",
-                            tint = Color(0xFF90CAF9),
-                            modifier = Modifier.size(64.dp)
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            text = "Connection Issue",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = errorMessage,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color(0xFFB0BEC5),
-                            textAlign = TextAlign.Center
-                        )
-                        Spacer(modifier = Modifier.height(24.dp))
-                        Button(
-                            onClick = {
+                    LiquidGlassButton(
+                        onClick = {
+                            if (NetworkMonitor.isOnline(context)) {
                                 hasError = false
                                 isLoading = true
                                 webView?.reload()
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5)),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Icon(Icons.Default.Refresh, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Retry Loading", color = Color.White)
-                        }
-                    }
+                            } else {
+                                Toast.makeText(context, "Viewing Offline Cached Study Content", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        icon = Icons.Default.SignalWifiOff,
+                        text = "Offline Mode · Cached View",
+                        accentColor = Color(0xFF00E5FF),
+                        isPill = true
+                    )
                 }
+            }
+
+            // Offline Hub Screen when disconnected / un-cached page requested
+            if (hasError) {
+                OfflineHubScreen(
+                    onRetry = {
+                        hasError = false
+                        isLoading = true
+                        webView?.reload()
+                    },
+                    onTryLoadCache = {
+                        hasError = false
+                        isLoading = true
+                        webView?.settings?.cacheMode = WebSettings.LOAD_CACHE_ONLY
+                        webView?.reload()
+                    },
+                    onOpenPdf = { filePath, title ->
+                        activePdfSource = filePath
+                        activePdfTitle = title
+                    }
+                )
+            }
+
+            // Inbuilt High-Performance PDF Opener with Liquid Glass UI
+            if (activePdfSource != null) {
+                PdfViewerScreen(
+                    pdfSource = activePdfSource!!,
+                    title = activePdfTitle,
+                    onClose = {
+                        activePdfSource = null
+                        activePdfTitle = null
+                    }
+                )
             }
 
             // Full Screen Animated Butter Wave Landing / Processing Overlay with StudyVerse Logo
             AnimatedVisibility(
                 visible = isLoading && !hasError,
-                enter = fadeIn(),
-                exit = fadeOut(animationSpec = tween(700))
+                enter = fadeIn(animationSpec = tween(250)),
+                exit = fadeOut(animationSpec = tween(350, easing = FastOutSlowInEasing))
             ) {
                 LoadingOverlay(progress = progress)
             }
@@ -1011,6 +1257,13 @@ fun LoadingOverlay(progress: Float) {
         label = "ParticleTime"
     )
 
+    val topWave1 = remember { Path() }
+    val topWave2 = remember { Path() }
+    val bottomWave1 = remember { Path() }
+    val bottomWave2 = remember { Path() }
+    val energyLine1 = remember { Path() }
+    val energyLine2 = remember { Path() }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1102,18 +1355,17 @@ fun LoadingOverlay(progress: Float) {
             }
 
             // 5. TOP Waves (Hanging down from the ceiling)
-            val topWave1 = Path().apply {
-                moveTo(0f, height * 0.35f)
-                var x = 0f
-                while (x <= width + 20f) {
-                    val y = height * 0.35f + sin(x * 0.004f + phase1) * 140f + cos(x * 0.007f - phase2) * 60f
-                    lineTo(x, y)
-                    x += 10f
-                }
-                lineTo(width, 0f)
-                lineTo(0f, 0f)
-                close()
+            topWave1.rewind()
+            topWave1.moveTo(0f, height * 0.35f)
+            var x = 0f
+            while (x <= width + 20f) {
+                val y = height * 0.35f + sin(x * 0.004f + phase1) * 140f + cos(x * 0.007f - phase2) * 60f
+                topWave1.lineTo(x, y)
+                x += 10f
             }
+            topWave1.lineTo(width, 0f)
+            topWave1.lineTo(0f, 0f)
+            topWave1.close()
             drawPath(
                 path = topWave1,
                 brush = Brush.verticalGradient(
@@ -1122,18 +1374,17 @@ fun LoadingOverlay(progress: Float) {
                 )
             )
 
-            val topWave2 = Path().apply {
-                moveTo(0f, height * 0.20f)
-                var x = 0f
-                while (x <= width + 20f) {
-                    val y = height * 0.20f + sin(x * 0.006f - phase2) * 90f + sin(x * 0.01f + phase3) * 50f
-                    lineTo(x, y)
-                    x += 10f
-                }
-                lineTo(width, 0f)
-                lineTo(0f, 0f)
-                close()
+            topWave2.rewind()
+            topWave2.moveTo(0f, height * 0.20f)
+            x = 0f
+            while (x <= width + 20f) {
+                val y = height * 0.20f + sin(x * 0.006f - phase2) * 90f + sin(x * 0.01f + phase3) * 50f
+                topWave2.lineTo(x, y)
+                x += 10f
             }
+            topWave2.lineTo(width, 0f)
+            topWave2.lineTo(0f, 0f)
+            topWave2.close()
             drawPath(
                 path = topWave2,
                 brush = Brush.verticalGradient(
@@ -1143,18 +1394,17 @@ fun LoadingOverlay(progress: Float) {
             )
 
             // 6. BOTTOM Waves (Rising up from the floor)
-            val bottomWave1 = Path().apply {
-                moveTo(0f, height * 0.65f)
-                var x = 0f
-                while (x <= width + 20f) {
-                    val y = height * 0.65f + sin(x * 0.005f + phase2) * 150f + sin(x * 0.008f - phase3) * 80f
-                    lineTo(x, y)
-                    x += 10f
-                }
-                lineTo(width, height)
-                lineTo(0f, height)
-                close()
+            bottomWave1.rewind()
+            bottomWave1.moveTo(0f, height * 0.65f)
+            x = 0f
+            while (x <= width + 20f) {
+                val y = height * 0.65f + sin(x * 0.005f + phase2) * 150f + sin(x * 0.008f - phase3) * 80f
+                bottomWave1.lineTo(x, y)
+                x += 10f
             }
+            bottomWave1.lineTo(width, height)
+            bottomWave1.lineTo(0f, height)
+            bottomWave1.close()
             drawPath(
                 path = bottomWave1,
                 brush = Brush.verticalGradient(
@@ -1163,18 +1413,17 @@ fun LoadingOverlay(progress: Float) {
                 )
             )
 
-            val bottomWave2 = Path().apply {
-                moveTo(0f, height * 0.80f)
-                var x = 0f
-                while (x <= width + 20f) {
-                    val y = height * 0.80f + cos(x * 0.007f - phase1) * 100f + sin(x * 0.012f + phase2) * 55f
-                    lineTo(x, y)
-                    x += 10f
-                }
-                lineTo(width, height)
-                lineTo(0f, height)
-                close()
+            bottomWave2.rewind()
+            bottomWave2.moveTo(0f, height * 0.80f)
+            x = 0f
+            while (x <= width + 20f) {
+                val y = height * 0.80f + cos(x * 0.007f - phase1) * 100f + sin(x * 0.012f + phase2) * 55f
+                bottomWave2.lineTo(x, y)
+                x += 10f
             }
+            bottomWave2.lineTo(width, height)
+            bottomWave2.lineTo(0f, height)
+            bottomWave2.close()
             drawPath(
                 path = bottomWave2,
                 brush = Brush.verticalGradient(
@@ -1184,14 +1433,13 @@ fun LoadingOverlay(progress: Float) {
             )
 
             // 7. Dynamic Shimmer Energy Lines cutting across the screen
-            val energyLine1 = Path().apply {
-                moveTo(0f, height * 0.42f)
-                var x = 0f
-                while (x <= width + 20f) {
-                    val y = height * 0.42f + sin(x * 0.004f + phase1 * 1.4f) * 160f
-                    lineTo(x, y)
-                    x += 15f
-                }
+            energyLine1.rewind()
+            energyLine1.moveTo(0f, height * 0.42f)
+            x = 0f
+            while (x <= width + 20f) {
+                val y = height * 0.42f + sin(x * 0.004f + phase1 * 1.4f) * 160f
+                energyLine1.lineTo(x, y)
+                x += 15f
             }
             drawPath(
                 path = energyLine1,
@@ -1201,14 +1449,13 @@ fun LoadingOverlay(progress: Float) {
                 style = Stroke(width = 3.5.dp.toPx())
             )
 
-            val energyLine2 = Path().apply {
-                moveTo(0f, height * 0.58f)
-                var x = 0f
-                while (x <= width + 20f) {
-                    val y = height * 0.58f + cos(x * 0.005f - phase2 * 1.3f) * 130f
-                    lineTo(x, y)
-                    x += 15f
-                }
+            energyLine2.rewind()
+            energyLine2.moveTo(0f, height * 0.58f)
+            x = 0f
+            while (x <= width + 20f) {
+                val y = height * 0.58f + cos(x * 0.005f - phase2 * 1.3f) * 130f
+                energyLine2.lineTo(x, y)
+                x += 15f
             }
             drawPath(
                 path = energyLine2,

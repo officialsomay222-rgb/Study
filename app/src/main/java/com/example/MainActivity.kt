@@ -716,6 +716,14 @@ fun WebViewScreen(
                                         }
                                         return true
                                     }
+
+                                    override fun onRenderProcessGone(v: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
+                                        v?.let { wv ->
+                                            (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+                                            wv.destroy()
+                                        }
+                                        return true
+                                    }
                                 }
                                 val transport = resultMsg?.obj as? WebView.WebViewTransport
                                 transport?.webView = newWebView
@@ -1011,6 +1019,16 @@ fun WebViewScreen(
                                         }
                                     }
                                 }
+                            }
+
+                            override fun onRenderProcessGone(view: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
+                                view?.let { wv ->
+                                    (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+                                    wv.destroy()
+                                }
+                                hasError = true
+                                errorMessage = "Graphics renderer refreshed. Tap retry to reload StudyVerse."
+                                return true
                             }
                         }
 

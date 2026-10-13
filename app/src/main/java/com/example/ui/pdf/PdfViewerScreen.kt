@@ -9,8 +9,10 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutLinearInEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -22,8 +24,10 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -32,6 +36,7 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -49,11 +54,14 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
@@ -107,10 +115,25 @@ fun PdfViewerScreen(
     // Floating Orb Menu State (Bottom-Right Ball)
     var isOrbMenuOpen by remember { mutableStateOf(false) }
 
-    // Zoom & pan state
-    var zoomScale by remember { mutableStateOf(1f) }
-    var panOffsetX by remember { mutableStateOf(0f) }
-    var panOffsetY by remember { mutableStateOf(0f) }
+    // Fluid continuous Zoom & pan state with spring interpolation
+    var zoomScale by remember { mutableFloatStateOf(1f) }
+    var panOffsetX by remember { mutableFloatStateOf(0f) }
+    var panOffsetY by remember { mutableFloatStateOf(0f) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var lastTapTime by remember { mutableLongStateOf(0L) }
+
+    fun animateZoomAndPan(targetZoom: Float, targetPanX: Float = 0f, targetPanY: Float = 0f) {
+        coroutineScope.launch {
+            val startZoom = zoomScale
+            val startPanX = panOffsetX
+            val startPanY = panOffsetY
+            animate(0f, 1f, animationSpec = tween(220, easing = FastOutSlowInEasing)) { progress, _ ->
+                zoomScale = startZoom + (targetZoom - startZoom) * progress
+                panOffsetX = startPanX + (targetPanX - startPanX) * progress
+                panOffsetY = startPanY + (targetPanY - startPanY) * progress
+            }
+        }
+    }
 
     // Adaptive slider state
     var isScrubbing by remember { mutableStateOf(false) }
@@ -248,10 +271,15 @@ fun PdfViewerScreen(
     // LazyListState for continuous vertical flow mode
     val listState = rememberLazyListState()
 
-    // Sync current page between modes and states
+    // Sync current page between modes and states, resetting zoom on page flip
     LaunchedEffect(pagerState.currentPage) {
         if (viewMode == PdfViewMode.PAGE_SWIPE && pageCount > 0) {
             currentPageIndex = pagerState.currentPage
+            if (zoomScale > 1.05f) {
+                zoomScale = 1f
+                panOffsetX = 0f
+                panOffsetY = 0f
+            }
         }
     }
 
@@ -265,10 +293,12 @@ fun PdfViewerScreen(
     val nestedScrollConnection = remember {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (available.y < -15f && barsVisible && !isOrbMenuOpen) {
-                    barsVisible = false
-                } else if (available.y > 15f && !barsVisible) {
-                    barsVisible = true
+                if (zoomScale <= 1.05f) {
+                    if (available.y < -15f && barsVisible && !isOrbMenuOpen) {
+                        barsVisible = false
+                    } else if (available.y > 15f && !barsVisible) {
+                        barsVisible = true
+                    }
                 }
                 return Offset.Zero
             }
@@ -338,37 +368,97 @@ fun PdfViewerScreen(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    .onSizeChanged { containerSize = it }
                     .pointerInput(Unit) {
-                        detectTapGestures(
-                            onTap = {
-                                if (isOrbMenuOpen) {
-                                    isOrbMenuOpen = false
-                                } else {
-                                    barsVisible = !barsVisible
+                        awaitEachGesture {
+                            val firstDown = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            val downTime = System.currentTimeMillis()
+                            val downPos = firstDown.position
+                            var isMultiTouch = false
+                            var hasMoved = false
+                            val touchSlop = viewConfiguration.touchSlop
+
+                            do {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val activePointers = event.changes.filter { it.pressed }
+                                val count = activePointers.size
+
+                                if (count >= 2) {
+                                    // TWO-FINGER GESTURE: Guaranteed immediate, proportional pinch-to-zoom & two-finger pan
+                                    isMultiTouch = true
+                                    hasMoved = true
+
+                                    val zoomFactor = event.calculateZoom()
+                                    val panDelta = event.calculatePan()
+
+                                    // Proportional continuous zoom: slow pinch zooms slowly, fast pinch zooms quickly
+                                    if (zoomFactor != 1f && zoomFactor > 0f) {
+                                        zoomScale = (zoomScale * zoomFactor).coerceIn(0.85f, 5.0f)
+                                    }
+
+                                    if (zoomScale > 1.0f && panDelta != Offset.Zero) {
+                                        val cw = if (containerSize.width > 0) containerSize.width else 1080
+                                        val ch = if (containerSize.height > 0) containerSize.height else 1920
+                                        val maxPanX = max(0f, ((zoomScale - 1f) * cw) / 2f + 80f)
+                                        val maxPanY = max(0f, ((zoomScale - 1f) * ch) / 2f + 120f)
+                                        panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
+                                        panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
+                                    }
+
+                                    // Intercept and consume so HorizontalPager / LazyColumn never hijack the multi-touch gesture
+                                    event.changes.forEach { it.consume() }
+                                } else if (count == 1 && zoomScale > 1.05f) {
+                                    // ONE FINGER DRAG WHILE ZOOMED IN: Smoothly pan across the enlarged document
+                                    val change = activePointers.first()
+                                    val dist = (change.position - downPos).getDistance()
+                                    if (dist > touchSlop || hasMoved) {
+                                        hasMoved = true
+                                        val panDelta = event.calculatePan()
+                                        if (panDelta != Offset.Zero) {
+                                            val cw = if (containerSize.width > 0) containerSize.width else 1080
+                                            val ch = if (containerSize.height > 0) containerSize.height else 1920
+                                            val maxPanX = max(0f, ((zoomScale - 1f) * cw) / 2f + 80f)
+                                            val maxPanY = max(0f, ((zoomScale - 1f) * ch) / 2f + 120f)
+                                            panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
+                                            panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
+                                        }
+                                        change.consume()
+                                    }
                                 }
-                            },
-                            onDoubleTap = {
-                                if (zoomScale > 1.2f) {
-                                    zoomScale = 1f
-                                    panOffsetX = 0f
-                                    panOffsetY = 0f
-                                } else {
-                                    zoomScale = 2.0f
-                                }
+                            } while (event.changes.any { it.pressed })
+
+                            // Snap-back animation if pinched smaller than 1.0x
+                            if (zoomScale < 1.0f) {
+                                animateZoomAndPan(1f, 0f, 0f)
                             }
-                        )
-                    }
-                    .pointerInput(Unit) {
-                        detectTransformGestures { _, pan, zoom, _ ->
-                            if (zoomScale > 1.05f || zoom > 1.05f) {
-                                zoomScale = (zoomScale * zoom).coerceIn(1f, 4.0f)
-                                if (zoomScale > 1f) {
-                                    val maxOffset = 500f * zoomScale
-                                    panOffsetX = (panOffsetX + pan.x * zoomScale).coerceIn(-maxOffset, maxOffset)
-                                    panOffsetY = (panOffsetY + pan.y * zoomScale).coerceIn(-maxOffset, maxOffset)
-                                } else {
-                                    panOffsetX = 0f
-                                    panOffsetY = 0f
+
+                            // Tap & Double Tap detection (fires only when stationary single touch)
+                            if (!isMultiTouch && !hasMoved) {
+                                val upTime = System.currentTimeMillis()
+                                if (upTime - downTime < 350L) {
+                                    if (upTime - lastTapTime < 320L) {
+                                        // DOUBLE TAP: Fluid spring animation between 1x and 2.25x
+                                        lastTapTime = 0L
+                                        if (zoomScale > 1.15f) {
+                                            animateZoomAndPan(1f, 0f, 0f)
+                                        } else {
+                                            animateZoomAndPan(2.25f, 0f, 0f)
+                                        }
+                                    } else {
+                                        lastTapTime = upTime
+                                        coroutineScope.launch {
+                                            delay(320L)
+                                            if (lastTapTime == upTime) {
+                                                lastTapTime = 0L
+                                                // SINGLE TAP: Toggle clean UI chrome or close orb menu
+                                                if (isOrbMenuOpen) {
+                                                    isOrbMenuOpen = false
+                                                } else {
+                                                    barsVisible = !barsVisible
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -397,7 +487,7 @@ fun PdfViewerScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(
-                                    top = if (barsVisible) 76.dp else 24.dp,
+                                    top = if (barsVisible && zoomScale <= 1.05f) 76.dp else 24.dp,
                                     bottom = 24.dp,
                                     start = 8.dp,
                                     end = 8.dp
@@ -408,6 +498,7 @@ fun PdfViewerScreen(
                     // CONTINUOUS VERTICAL FLOW
                     LazyColumn(
                         state = listState,
+                        userScrollEnabled = zoomScale <= 1.05f,
                         modifier = Modifier
                             .fillMaxSize()
                             .graphicsLayer {
@@ -417,7 +508,7 @@ fun PdfViewerScreen(
                                 translationY = panOffsetY
                             },
                         contentPadding = PaddingValues(
-                            top = if (barsVisible) 80.dp else 32.dp,
+                            top = if (barsVisible && zoomScale <= 1.05f) 80.dp else 32.dp,
                             bottom = 40.dp
                         ),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -785,6 +876,9 @@ fun PdfViewerScreen(
                 onScrubFinished = { targetPage ->
                     isScrubbing = false
                     currentPageIndex = targetPage
+                    if (zoomScale > 1.05f) {
+                        animateZoomAndPan(1f, 0f, 0f)
+                    }
                     coroutineScope.launch {
                         if (viewMode == PdfViewMode.PAGE_SWIPE) {
                             pagerState.animateScrollToPage(targetPage)
@@ -824,6 +918,9 @@ fun PdfViewerScreen(
                     }
                 },
                 onToggleViewMode = {
+                    zoomScale = 1f
+                    panOffsetX = 0f
+                    panOffsetY = 0f
                     val newMode = if (viewMode == PdfViewMode.PAGE_SWIPE) {
                         PdfViewMode.CONTINUOUS_FLOW
                     } else {
@@ -851,9 +948,7 @@ fun PdfViewerScreen(
                     }
                 },
                 onResetZoom = {
-                    zoomScale = 1f
-                    panOffsetX = 0f
-                    panOffsetY = 0f
+                    animateZoomAndPan(1f, 0f, 0f)
                 },
                 onClose = {
                     isOrbMenuOpen = false
@@ -919,6 +1014,11 @@ fun PdfViewerScreen(
                             if (parsed != null && parsed in 1..pageCount) {
                                 val target = parsed - 1
                                 currentPageIndex = target
+                                if (zoomScale > 1.05f) {
+                                    zoomScale = 1f
+                                    panOffsetX = 0f
+                                    panOffsetY = 0f
+                                }
                                 coroutineScope.launch {
                                     if (viewMode == PdfViewMode.PAGE_SWIPE) {
                                         pagerState.animateScrollToPage(target)

@@ -1,5 +1,7 @@
 package com.example.ui.pdf
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
@@ -36,7 +38,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
@@ -48,7 +49,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
 
 /**
  * Ultra-premium Liquid Glass button with specular rim, translucent frosted body,
@@ -187,25 +187,22 @@ fun LiquidGlassOrbButton(
     )
 
     // Expanding liquid ripple ring effect when opening
-    var rippleScale by remember { mutableFloatStateOf(0f) }
-    var rippleAlpha by remember { mutableFloatStateOf(0f) }
+    val rippleProgress = remember { Animatable(0f) }
 
     LaunchedEffect(isOpen) {
         if (isOpen) {
-            rippleScale = 0.8f
-            rippleAlpha = 0.8f
-            val startTime = System.currentTimeMillis()
-            while (System.currentTimeMillis() - startTime < 400) {
-                val fraction = (System.currentTimeMillis() - startTime) / 400f
-                rippleScale = 0.8f + (fraction * 1.5f)
-                rippleAlpha = (1f - fraction) * 0.75f
-                delay(16)
-            }
-            rippleAlpha = 0f
+            rippleProgress.snapTo(0f)
+            rippleProgress.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(durationMillis = 400, easing = FastOutSlowInEasing)
+            )
         } else {
-            rippleAlpha = 0f
+            rippleProgress.snapTo(0f)
         }
     }
+
+    val rippleScale = 0.8f + (rippleProgress.value * 1.5f)
+    val rippleAlpha = (1f - rippleProgress.value) * 0.75f
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -387,7 +384,6 @@ fun LiquidGlassBackdrop(
         modifier = modifier
             .fillMaxSize()
             .background(scrimBrush)
-            .blur(8.dp)
             .pointerInput(Unit) {
                 detectTapGestures(onTap = { onDismiss() })
             }

@@ -570,9 +570,7 @@ fun WebViewScreen(
                             // High-speed caching & smooth scrolling optimization: fallback to cache when offline
                             cacheMode = if (isOnline) WebSettings.LOAD_DEFAULT else WebSettings.LOAD_CACHE_ELSE_NETWORK
                             loadsImagesAutomatically = true
-                            offscreenPreRaster = true
-                            @Suppress("DEPRECATION")
-                            setRenderPriority(WebSettings.RenderPriority.HIGH)
+                            offscreenPreRaster = false
                         }
                         
                         CookieManager.getInstance().setAcceptCookie(true)

@@ -1,5 +1,6 @@
 package com.example.ui.pdf
 
+import android.app.Activity
 import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
@@ -13,6 +14,7 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -26,6 +28,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.*
@@ -58,6 +61,9 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -94,9 +100,41 @@ fun PdfViewerScreen(
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
+    val activity = context as? Activity
     val coroutineScope = rememberCoroutineScope()
     val displayMetrics = context.resources.displayMetrics
     val screenDensity = displayMetrics.densityDpi / 160f
+
+    // Fullscreen Immersive Mode: Hide phone buttons & status bar in PDF opener state
+    // Automatically restores phone buttons & status bar on exit
+    DisposableEffect(activity) {
+        val window = activity?.window
+        val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+
+        insetsController?.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        insetsController?.hide(WindowInsetsCompat.Type.systemBars())
+
+        onDispose {
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    var isVisible by remember { mutableStateOf(false) }
+    var isClosing by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        isVisible = true
+    }
+
+    fun safeClose() {
+        if (isClosing) return
+        isClosing = true
+        coroutineScope.launch {
+            delay(180)
+            onClose()
+        }
+    }
 
     var localPdfFile by remember { mutableStateOf<File?>(null) }
     var downloadProgress by remember { mutableStateOf(0f) }
@@ -109,7 +147,7 @@ fun PdfViewerScreen(
 
     // UI state: auto-hide bars on scroll down
     var barsVisible by remember { mutableStateOf(true) }
-    var viewMode by remember { mutableStateOf(PdfViewMode.PAGE_SWIPE) }
+    var viewMode by remember { mutableStateOf(PdfViewMode.CONTINUOUS_FLOW) }
     var paperTheme by remember { mutableStateOf(PaperTheme.CLEAN_WHITE) }
 
     // Floating Orb Menu State (Bottom-Right Ball)
@@ -152,12 +190,12 @@ fun PdfViewerScreen(
         }
     }
 
-    // Intercept back button to close orb menu first if open
+    // Intercept back button to close orb menu first if open, or trigger smooth exit
     BackHandler {
         if (isOrbMenuOpen) {
             isOrbMenuOpen = false
         } else {
-            onClose()
+            safeClose()
         }
     }
 
@@ -333,9 +371,25 @@ fun PdfViewerScreen(
         }
     }
 
+    val screenAlpha by animateFloatAsState(
+        targetValue = if (isVisible && !isClosing) 1f else 0f,
+        animationSpec = tween(220, easing = FastOutSlowInEasing),
+        label = "screenAlpha"
+    )
+    val screenScale by animateFloatAsState(
+        targetValue = if (isVisible && !isClosing) 1f else 0.96f,
+        animationSpec = tween(220, easing = FastOutSlowInEasing),
+        label = "screenScale"
+    )
+
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .graphicsLayer {
+                alpha = screenAlpha
+                scaleX = screenScale
+                scaleY = screenScale
+            }
             .background(readerBackgroundColor)
             .nestedScroll(nestedScrollConnection)
     ) {
@@ -378,71 +432,139 @@ fun PdfViewerScreen(
                             var hasMoved = false
                             val touchSlop = viewConfiguration.touchSlop
 
+                            val cw = if (containerSize.width > 0) containerSize.width.toFloat() else 1080f
+                            val ch = if (containerSize.height > 0) containerSize.height.toFloat() else 1920f
+                            val centerX = cw / 2f
+                            val centerY = ch / 2f
+
                             do {
                                 val event = awaitPointerEvent(PointerEventPass.Initial)
                                 val activePointers = event.changes.filter { it.pressed }
                                 val count = activePointers.size
 
                                 if (count >= 2) {
-                                    // TWO-FINGER GESTURE: Guaranteed immediate, proportional pinch-to-zoom & two-finger pan
+                                    // TWO-FINGER GESTURE: Dynamic centroid focal-point pinch-to-zoom & pan
                                     isMultiTouch = true
                                     hasMoved = true
 
-                                    val zoomFactor = event.calculateZoom()
+                                    val centroid = event.calculateCentroid(useCurrent = true)
+                                    val rawZoom = event.calculateZoom()
                                     val panDelta = event.calculatePan()
 
-                                    // Proportional continuous zoom: slow pinch zooms slowly, fast pinch zooms quickly
-                                    if (zoomFactor != 1f && zoomFactor > 0f) {
-                                        zoomScale = (zoomScale * zoomFactor).coerceIn(0.85f, 5.0f)
+                                    // Dynamic zooming: sensitive, continuous scaling with focal anchoring
+                                    if (rawZoom > 0f && rawZoom != 1f) {
+                                        val oldZoom = zoomScale
+                                        val targetZoom = (oldZoom * rawZoom).coerceIn(0.85f, 5.5f)
+                                        val scaleRatio = targetZoom / oldZoom
+
+                                        // Centroid focal shift: keeps content under fingers locked to hand gesture
+                                        val focusX = centroid.x - centerX
+                                        val focalShiftX = (focusX - panOffsetX) * (1f - scaleRatio)
+
+                                        zoomScale = targetZoom
+                                        panOffsetX = panOffsetX + focalShiftX + panDelta.x
+
+                                        if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
+                                            panOffsetY = 0f
+                                            if (panDelta.y != 0f) {
+                                                listState.dispatchRawDelta(-panDelta.y)
+                                            }
+                                        } else {
+                                            val focusY = centroid.y - centerY
+                                            val focalShiftY = (focusY - panOffsetY) * (1f - scaleRatio)
+                                            panOffsetY = panOffsetY + focalShiftY + panDelta.y
+                                        }
+                                    } else if (panDelta != Offset.Zero) {
+                                        panOffsetX += panDelta.x
+                                        if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
+                                            panOffsetY = 0f
+                                            if (panDelta.y != 0f) {
+                                                listState.dispatchRawDelta(-panDelta.y)
+                                            }
+                                        } else {
+                                            panOffsetY += panDelta.y
+                                        }
                                     }
 
-                                    if (zoomScale > 1.0f && panDelta != Offset.Zero) {
-                                        val cw = if (containerSize.width > 0) containerSize.width else 1080
-                                        val ch = if (containerSize.height > 0) containerSize.height else 1920
-                                        val maxPanX = max(0f, ((zoomScale - 1f) * cw) / 2f + 80f)
-                                        val maxPanY = max(0f, ((zoomScale - 1f) * ch) / 2f + 120f)
-                                        panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
-                                        panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
-                                    }
-
-                                    // Intercept and consume so HorizontalPager / LazyColumn never hijack the multi-touch gesture
+                                    // Intercept and consume so underlying pager does not scroll during pinch
                                     event.changes.forEach { it.consume() }
-                                } else if (count == 1 && zoomScale > 1.05f) {
-                                    // ONE FINGER DRAG WHILE ZOOMED IN: Smoothly pan across the enlarged document
+                                } else if (count == 1) {
                                     val change = activePointers.first()
                                     val dist = (change.position - downPos).getDistance()
-                                    if (dist > touchSlop || hasMoved) {
+                                    if (dist > touchSlop) {
                                         hasMoved = true
-                                        val panDelta = event.calculatePan()
-                                        if (panDelta != Offset.Zero) {
-                                            val cw = if (containerSize.width > 0) containerSize.width else 1080
-                                            val ch = if (containerSize.height > 0) containerSize.height else 1920
-                                            val maxPanX = max(0f, ((zoomScale - 1f) * cw) / 2f + 80f)
-                                            val maxPanY = max(0f, ((zoomScale - 1f) * ch) / 2f + 120f)
-                                            panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
-                                            panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
-                                        }
-                                        change.consume()
                                     }
+
+                                    if (zoomScale > 1.05f) {
+                                        // ONE FINGER DRAG WHILE ZOOMED IN: Smoothly scroll and pan
+                                        if (dist > touchSlop || hasMoved) {
+                                            val panDelta = event.calculatePan()
+                                            if (panDelta != Offset.Zero) {
+                                                if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
+                                                    // In Flow mode: Directly scroll list up/down seamlessly through all pages
+                                                    if (panDelta.y != 0f) {
+                                                        listState.dispatchRawDelta(-panDelta.y)
+                                                    }
+                                                    if (panDelta.x != 0f) {
+                                                        val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 80f)
+                                                        panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
+                                                    }
+                                                    panOffsetY = 0f
+                                                } else {
+                                                    // In Page Swipe mode: Pan inside the current page
+                                                    val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 80f)
+                                                    val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + 120f)
+                                                    panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
+                                                    panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
+                                                }
+                                            }
+                                            change.consume()
+                                        }
+                                    }
+                                    // When zoomScale <= 1.05f, we DO NOT consume!
+                                    // Native gestures scroll list or flip pages freely
                                 }
                             } while (event.changes.any { it.pressed })
 
-                            // Snap-back animation if pinched smaller than 1.0x
+                            // Snap-back bounds checking on finger release
+                            val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
+                            val maxPanY = if (viewMode == PdfViewMode.CONTINUOUS_FLOW) 0f else max(0f, (ch * (zoomScale - 1f)) / 2f)
+
                             if (zoomScale < 1.0f) {
                                 animateZoomAndPan(1f, 0f, 0f)
+                            } else if (zoomScale > 5.0f) {
+                                animateZoomAndPan(
+                                    5.0f,
+                                    panOffsetX.coerceIn(-maxPanX, maxPanX),
+                                    if (viewMode == PdfViewMode.CONTINUOUS_FLOW) 0f else panOffsetY.coerceIn(-maxPanY, maxPanY)
+                                )
+                            } else if (zoomScale > 1.05f) {
+                                val clampedX = panOffsetX.coerceIn(-maxPanX, maxPanX)
+                                val clampedY = if (viewMode == PdfViewMode.CONTINUOUS_FLOW) 0f else panOffsetY.coerceIn(-maxPanY, maxPanY)
+                                if (clampedX != panOffsetX || clampedY != panOffsetY) {
+                                    animateZoomAndPan(zoomScale, clampedX, clampedY)
+                                }
                             }
 
                             // Tap & Double Tap detection (fires only when stationary single touch)
                             if (!isMultiTouch && !hasMoved) {
                                 val upTime = System.currentTimeMillis()
-                                if (upTime - downTime < 350L) {
+                                if (upTime - downTime < 320L) {
                                     if (upTime - lastTapTime < 320L) {
-                                        // DOUBLE TAP: Fluid spring animation between 1x and 2.25x
+                                        // DOUBLE TAP: Dynamic focal zoom in to 2.25x or reset to 1x
                                         lastTapTime = 0L
                                         if (zoomScale > 1.15f) {
                                             animateZoomAndPan(1f, 0f, 0f)
                                         } else {
-                                            animateZoomAndPan(2.25f, 0f, 0f)
+                                            val focusX = downPos.x - centerX
+                                            val targetPanX = (-focusX * 1.25f).coerceIn(-cw * 0.625f, cw * 0.625f)
+                                            if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
+                                                animateZoomAndPan(2.25f, targetPanX, 0f)
+                                            } else {
+                                                val focusY = downPos.y - centerY
+                                                val targetPanY = (-focusY * 1.25f).coerceIn(-ch * 0.625f, ch * 0.625f)
+                                                animateZoomAndPan(2.25f, targetPanX, targetPanY)
+                                            }
                                         }
                                     } else {
                                         lastTapTime = upTime
@@ -468,7 +590,7 @@ fun PdfViewerScreen(
                     // HORIZONTAL SWIPE PAGER WITH BEYOND-VIEWPORT PREFETCHING
                     HorizontalPager(
                         state = pagerState,
-                        beyondViewportPageCount = 1,
+                        beyondViewportPageCount = 2,
                         modifier = Modifier
                             .fillMaxSize()
                             .graphicsLayer {
@@ -484,11 +606,12 @@ fun PdfViewerScreen(
                             pageIndex = pageIdx,
                             engine = engine,
                             colorFilter = paperColorFilter,
+                            isSwipeMode = true,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(
-                                    top = if (barsVisible && zoomScale <= 1.05f) 76.dp else 24.dp,
-                                    bottom = 24.dp,
+                                    top = if (barsVisible && zoomScale <= 1.05f) 72.dp else 16.dp,
+                                    bottom = if (barsVisible && zoomScale <= 1.05f) 72.dp else 16.dp,
                                     start = 8.dp,
                                     end = 8.dp
                                 )
@@ -498,14 +621,14 @@ fun PdfViewerScreen(
                     // CONTINUOUS VERTICAL FLOW
                     LazyColumn(
                         state = listState,
-                        userScrollEnabled = zoomScale <= 1.05f,
+                        userScrollEnabled = true,
                         modifier = Modifier
                             .fillMaxSize()
                             .graphicsLayer {
                                 scaleX = zoomScale
                                 scaleY = zoomScale
                                 translationX = panOffsetX
-                                translationY = panOffsetY
+                                translationY = 0f
                             },
                         contentPadding = PaddingValues(
                             top = if (barsVisible && zoomScale <= 1.05f) 80.dp else 32.dp,
@@ -518,6 +641,7 @@ fun PdfViewerScreen(
                                 pageIndex = pageIdx,
                                 engine = engine,
                                 colorFilter = paperColorFilter,
+                                isSwipeMode = false,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(horizontal = 10.dp)
@@ -630,7 +754,7 @@ fun PdfViewerScreen(
                     )
                     Spacer(modifier = Modifier.height(20.dp))
                     Button(
-                        onClick = onClose,
+                        onClick = { safeClose() },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF5252))
                     ) {
                         Text("Go Back", color = Color.White, fontWeight = FontWeight.Bold)
@@ -698,7 +822,7 @@ fun PdfViewerScreen(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 LiquidGlassButton(
-                    onClick = onClose,
+                    onClick = { safeClose() },
                     icon = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = "Back",
                     accentColor = Color(0xFF00E5FF)

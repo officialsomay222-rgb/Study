@@ -43,11 +43,15 @@ fun OfflineHubScreen(
     val context = LocalContext.current
     var cachedPdfs by remember { mutableStateOf<List<File>>(emptyList()) }
 
-    // Load available cached study PDFs
+    // Load available cached study PDFs and documents
     LaunchedEffect(Unit) {
         val cacheFolder = File(context.cacheDir, "study_pdfs")
         if (cacheFolder.exists()) {
-            val files = cacheFolder.listFiles { f -> f.extension.equals("pdf", ignoreCase = true) }
+            val files = cacheFolder.listFiles { f -> 
+                f.extension.equals("pdf", ignoreCase = true) ||
+                f.extension.equals("docx", ignoreCase = true) ||
+                f.extension.equals("doc", ignoreCase = true)
+            }
             cachedPdfs = files?.sortedByDescending { it.lastModified() }?.toList() ?: emptyList()
         }
     }

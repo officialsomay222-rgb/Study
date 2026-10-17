@@ -89,8 +89,13 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.net.Uri
 import android.provider.OpenableColumns
+import androidx.core.content.ContextCompat
+import com.example.util.FileImportHelper
+import com.example.ui.pdf.DocxToPdfConverter
 
 class MainActivity : ComponentActivity() {
     private var webViewInstance: WebView? = null
@@ -99,6 +104,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode =
+                android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         handleIntent(intent)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         enableEdgeToEdge()
@@ -127,81 +136,20 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         if (intent == null) return
-        val action = intent.action
-        if (action == Intent.ACTION_VIEW || action == Intent.ACTION_SEND || action == Intent.ACTION_EDIT) {
-            val uri: Uri? = intent.data
-                ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
-                ?: if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
-                }
+        val uri = FileImportHelper.extractUriFromIntent(intent) ?: return
 
-            if (uri != null) {
-                val mimeType = intent.type ?: try { contentResolver.getType(uri) } catch (e: Exception) { null }
-                val isPdf = mimeType?.contains("pdf", ignoreCase = true) == true ||
-                            uri.toString().contains(".pdf", ignoreCase = true) ||
-                            (uri.scheme == "file" && uri.path?.endsWith(".pdf", ignoreCase = true) == true) ||
-                            action == Intent.ACTION_VIEW || action == Intent.ACTION_SEND
-
-                if (isPdf) {
-                    try {
-                        val displayName = try {
-                            if (uri.scheme == "content") {
-                                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                                    if (cursor.moveToFirst()) {
-                                        val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                                        if (colIdx != -1) cursor.getString(colIdx) else null
-                                    } else null
-                                }
-                            } else {
-                                uri.lastPathSegment
-                            }
-                        } catch (e: Exception) {
-                            null
-                        } ?: "Document.pdf"
-
-                        val cacheFolder = java.io.File(cacheDir, "study_pdfs").apply { mkdirs() }
-                        val safeName = displayName.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
-                        val finalFileName = if (safeName.endsWith(".pdf", ignoreCase = true)) safeName else "$safeName.pdf"
-                        val localFile = java.io.File(cacheFolder, "ext_${System.currentTimeMillis()}_$finalFileName")
-
-                        if (uri.scheme == "file") {
-                            val rawPath = uri.path ?: uri.toString().removePrefix("file://")
-                            val srcFile = java.io.File(rawPath)
-                            if (srcFile.exists() && srcFile.length() > 0) {
-                                srcFile.copyTo(localFile, overwrite = true)
-                            } else {
-                                contentResolver.openInputStream(uri)?.use { input ->
-                                    java.io.FileOutputStream(localFile).use { output ->
-                                        input.copyTo(output)
-                                    }
-                                }
-                            }
-                        } else {
-                            contentResolver.openInputStream(uri)?.use { input ->
-                                java.io.FileOutputStream(localFile).use { output ->
-                                    input.copyTo(output)
-                                }
-                            }
-                        }
-
-                        if (localFile.exists() && localFile.length() > 0) {
-                            incomingPdfUri = Uri.fromFile(localFile)
-                            incomingPdfName = displayName
-                        } else {
-                            incomingPdfUri = uri
-                            incomingPdfName = displayName
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                        incomingPdfUri = uri
-                        incomingPdfName = null
-                    }
-                }
+        // Take persistable permission if available
+        try {
+            val takeFlags = intent.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            if (takeFlags != 0) {
+                contentResolver.takePersistableUriPermission(uri, takeFlags)
             }
+        } catch (e: Exception) {
+            // Non-persistable URIs will throw, safe to ignore
         }
+
+        incomingPdfUri = uri
+        incomingPdfName = FileImportHelper.resolveDisplayName(this, uri)
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -300,23 +248,62 @@ fun WebViewScreen(
     // Handle incoming PDF from external apps / file manager / downloads
     LaunchedEffect(initialPdfUri) {
         if (initialPdfUri != null) {
-            val displayName = initialPdfTitle ?: try {
-                if (initialPdfUri.scheme == "content") {
-                    context.contentResolver.query(initialPdfUri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                        if (cursor.moveToFirst()) {
-                            val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                            if (colIdx != -1) cursor.getString(colIdx) else null
-                        } else null
-                    }
-                } else {
-                    initialPdfUri.lastPathSegment
-                }
-            } catch (e: Exception) {
-                null
-            } ?: "Document.pdf"
-            activePdfSource = if (initialPdfUri.scheme == "file") initialPdfUri.path else initialPdfUri.toString()
+            val displayName = initialPdfTitle ?: FileImportHelper.resolveDisplayName(context, initialPdfUri)
+            val path = if (initialPdfUri.scheme == "file") {
+                initialPdfUri.path ?: initialPdfUri.toString().removePrefix("file://")
+            } else {
+                initialPdfUri.toString()
+            }
+            activePdfSource = path
             activePdfTitle = displayName
             onClearIncomingPdf()
+        }
+    }
+
+    // Automatically load downloaded study materials as soon as DownloadManager finishes
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent?.action == DownloadManager.ACTION_DOWNLOAD_COMPLETE) {
+                    val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+                    if (id != -1L) {
+                        try {
+                            val dm = ctx?.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+                            val query = DownloadManager.Query().setFilterById(id)
+                            dm?.query(query)?.use { c ->
+                                if (c.moveToFirst()) {
+                                    val statusIdx = c.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                                    if (statusIdx != -1 && c.getInt(statusIdx) == DownloadManager.STATUS_SUCCESSFUL) {
+                                        val uriIdx = c.getColumnIndex(DownloadManager.COLUMN_LOCAL_URI)
+                                        val titleIdx = c.getColumnIndex(DownloadManager.COLUMN_TITLE)
+                                        val localUri = if (uriIdx != -1) c.getString(uriIdx) else null
+                                        val fileTitle = if (titleIdx != -1) c.getString(titleIdx)?.removePrefix("StudyVerse: ") else null
+                                        if (!localUri.isNullOrEmpty()) {
+                                            val uri = Uri.parse(localUri)
+                                            val name = fileTitle ?: FileImportHelper.resolveDisplayName(context, uri)
+                                            if (name.endsWith(".pdf", ignoreCase = true) || DocxToPdfConverter.isWordOrOfficeDocument(name, null)) {
+                                                activePdfSource = uri.toString()
+                                                activePdfTitle = name
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE)
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+        onDispose {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 
@@ -704,6 +691,9 @@ fun WebViewScreen(
 
                         setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, contentLength ->
                             var rawFileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
+                            val isWordDoc = DocxToPdfConverter.isWordOrOfficeDocument(rawFileName, mimeType) ||
+                                            downloadUrl.contains(".docx", ignoreCase = true) ||
+                                            downloadUrl.contains(".doc", ignoreCase = true)
                             val isPdf = (mimeType?.contains("pdf", ignoreCase = true) == true) ||
                                         (downloadUrl.contains(".pdf", ignoreCase = true)) ||
                                         (contentDisposition?.contains(".pdf", ignoreCase = true) == true) ||
@@ -721,7 +711,13 @@ fun WebViewScreen(
                                 rawFileName
                             }
 
-                            val finalMimeType = if (isPdf || finalFileName.endsWith(".pdf", ignoreCase = true)) "application/pdf" else (if (mimeType.isNullOrEmpty()) "application/octet-stream" else mimeType)
+                            val finalMimeType = if (isPdf || finalFileName.endsWith(".pdf", ignoreCase = true)) {
+                                "application/pdf"
+                            } else if (isWordDoc) {
+                                if (finalFileName.endsWith(".docx", ignoreCase = true)) "application/vnd.openxmlformats-officedocument.wordprocessingml.document" else "application/msword"
+                            } else {
+                                if (mimeType.isNullOrEmpty()) "application/octet-stream" else mimeType
+                            }
 
                             try {
                                 val request = DownloadManager.Request(android.net.Uri.parse(downloadUrl)).apply {
@@ -738,8 +734,8 @@ fun WebViewScreen(
                                 dm?.enqueue(request)
                                 Toast.makeText(ctx, "StudyVerse: Downloading $finalFileName to Downloads...", Toast.LENGTH_LONG).show()
 
-                                // Load PDF in inbuilt PDF viewer with Liquid Glass UI if not already viewing a document
-                                if (isPdf || finalFileName.endsWith(".pdf", ignoreCase = true)) {
+                                // Load PDF or Word in inbuilt viewer with Liquid Glass UI if not already viewing a document
+                                if (isPdf || isWordDoc || finalFileName.endsWith(".pdf", ignoreCase = true)) {
                                     (ctx as? Activity)?.runOnUiThread {
                                         if (activePdfSource == null) {
                                             activePdfSource = downloadUrl
@@ -914,9 +910,14 @@ fun WebViewScreen(
                                 }
                                 currentLoadedUrl = requestUrl
 
-                                if (requestUrl.endsWith(".pdf", ignoreCase = true) || 
-                                    (requestUrl.contains(".pdf", ignoreCase = true) && !requestUrl.contains("html"))) {
-                                    val guessName = URLUtil.guessFileName(requestUrl, null, "application/pdf")
+                                val isDocument = requestUrl.endsWith(".pdf", ignoreCase = true) || 
+                                                     requestUrl.endsWith(".docx", ignoreCase = true) ||
+                                                     requestUrl.endsWith(".doc", ignoreCase = true) ||
+                                                     (requestUrl.contains(".pdf", ignoreCase = true) && !requestUrl.contains("html")) ||
+                                                     (requestUrl.contains(".docx", ignoreCase = true) && !requestUrl.contains("html"))
+
+                                if (isDocument) {
+                                    val guessName = URLUtil.guessFileName(requestUrl, null, if (requestUrl.contains(".doc")) "application/msword" else "application/pdf")
                                     (ctx as? Activity)?.runOnUiThread {
                                         if (activePdfSource == null) {
                                             activePdfSource = requestUrl
@@ -971,9 +972,14 @@ fun WebViewScreen(
                                 }
                                 currentLoadedUrl = urlStr
 
-                                if (urlStr.endsWith(".pdf", ignoreCase = true) || 
-                                    (urlStr.contains(".pdf", ignoreCase = true) && !urlStr.contains("html"))) {
-                                    val guessName = URLUtil.guessFileName(urlStr, null, "application/pdf")
+                                val isDocStr = urlStr.endsWith(".pdf", ignoreCase = true) || 
+                                               urlStr.endsWith(".docx", ignoreCase = true) ||
+                                               urlStr.endsWith(".doc", ignoreCase = true) ||
+                                               (urlStr.contains(".pdf", ignoreCase = true) && !urlStr.contains("html")) ||
+                                               (urlStr.contains(".docx", ignoreCase = true) && !urlStr.contains("html"))
+
+                                if (isDocStr) {
+                                    val guessName = URLUtil.guessFileName(urlStr, null, if (urlStr.contains(".doc")) "application/msword" else "application/pdf")
                                     (ctx as? Activity)?.runOnUiThread {
                                         if (activePdfSource == null) {
                                             activePdfSource = urlStr
@@ -1298,7 +1304,7 @@ fun WebViewScreen(
 
             // Full Screen Animated Butter Wave Landing / Processing Overlay with StudyVerse Logo
             AnimatedVisibility(
-                visible = isLoading && !hasError,
+                visible = isLoading && !hasError && activePdfSource == null,
                 enter = fadeIn(animationSpec = tween(250)),
                 exit = fadeOut(animationSpec = tween(350, easing = FastOutSlowInEasing))
             ) {

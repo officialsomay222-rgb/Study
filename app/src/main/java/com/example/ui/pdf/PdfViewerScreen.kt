@@ -61,6 +61,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -82,6 +83,8 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.max
+import com.example.util.FileImportHelper
+import com.example.ui.pdf.DocxToPdfConverter
 
 /**
  * Ultra-Premium Inbuilt PDF Viewer with:
@@ -105,6 +108,13 @@ fun PdfViewerScreen(
     val coroutineScope = rememberCoroutineScope()
     val displayMetrics = context.resources.displayMetrics
     val screenDensity = displayMetrics.densityDpi / 160f
+
+    val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val cutoutTop = WindowInsets.displayCutout.asPaddingValues().calculateTopPadding()
+    val safeCutout = if (cutoutTop > 0.dp) cutoutTop else maxOf(statusBarTop, 24.dp)
+    // 3px visible gap situated strictly after camera notch
+    val notchGap = with(LocalDensity.current) { 3.toDp() }
+    val topBarNotchSafePadding = safeCutout + notchGap
 
     // Fullscreen Immersive Mode: Hide phone buttons & status bar in PDF opener state
     // Automatically restores phone buttons & status bar on exit
@@ -210,7 +220,7 @@ fun PdfViewerScreen(
         showAdaptivePageBadge = false
     }
 
-    // Document download & resolver worker
+    // Document download, resolver & renderer worker
     LaunchedEffect(pdfSource) {
         localPdfFile = null
         try {
@@ -229,129 +239,77 @@ fun PdfViewerScreen(
 
         withContext(Dispatchers.IO) {
             try {
-                if (pdfSource.startsWith("http://") || pdfSource.startsWith("https://")) {
-                    val pdfCacheDir = File(context.cacheDir, "study_pdfs").apply { mkdirs() }
-                    // Generate a unique MD5 hash of the URL to prevent cross-document cache collision
-                    val urlHash = java.security.MessageDigest.getInstance("MD5")
-                        .digest(pdfSource.toByteArray())
-                        .joinToString("") { "%02x".format(it) }
-                    val safeName = resolvedTitle.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
-                    val cachedFile = File(pdfCacheDir, "${urlHash}_$safeName")
-
-                    if (cachedFile.exists() && cachedFile.length() > 1024) {
-                        localPdfFile = cachedFile
-                        isDownloading = false
-                    } else {
-                        var currentUrl = pdfSource
-                        var connection = URL(currentUrl).openConnection() as HttpURLConnection
-                        connection.connectTimeout = 15000
-                        connection.readTimeout = 25000
-                        connection.instanceFollowRedirects = true
-                        var redirectCount = 0
-                        while (redirectCount < 5) {
-                            connection.connect()
-                            val responseCode = connection.responseCode
-                            if (responseCode in 300..399) {
-                                val newLocation = connection.getHeaderField("Location") ?: break
-                                currentUrl = if (newLocation.startsWith("http://") || newLocation.startsWith("https://")) {
-                                    newLocation
-                                } else {
-                                    URL(URL(currentUrl), newLocation).toString()
-                                }
-                                connection.disconnect()
-                                connection = URL(currentUrl).openConnection() as HttpURLConnection
-                                connection.connectTimeout = 15000
-                                connection.readTimeout = 25000
-                                connection.instanceFollowRedirects = true
-                                redirectCount++
-                            } else {
-                                break
-                            }
-                        }
-
-                        val fileLength = connection.contentLength
-                        val input: InputStream = connection.inputStream
-                        val tempFile = File(pdfCacheDir, "${cachedFile.name}.tmp")
-                        val output = FileOutputStream(tempFile)
-
-                        val data = ByteArray(8192)
-                        var total: Long = 0
-                        var count: Int
-                        while (input.read(data).also { count = it } != -1) {
-                            total += count
-                            if (fileLength > 0) {
-                                downloadProgress = total.toFloat() / fileLength
-                            }
-                            output.write(data, 0, count)
-                        }
-                        output.flush()
-                        output.close()
-                        input.close()
-                        connection.disconnect()
-
-                        if (tempFile.exists() && tempFile.length() > 512) {
-                            tempFile.renameTo(cachedFile)
-                        }
-                        localPdfFile = cachedFile
-                        isDownloading = false
-                    }
-                } else if (pdfSource.startsWith("content://")) {
-                    val uri = Uri.parse(pdfSource)
-                    val pdfCacheDir = File(context.cacheDir, "study_pdfs").apply { mkdirs() }
-                    val uriHash = java.security.MessageDigest.getInstance("MD5")
-                        .digest(pdfSource.toByteArray())
-                        .joinToString("") { "%02x".format(it) }
-                    val safeName = resolvedTitle.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
-                    val cachedFile = File(pdfCacheDir, "${uriHash}_$safeName")
-                    
-                    if (!cachedFile.exists() || cachedFile.length() <= 1024) {
-                        context.contentResolver.openInputStream(uri)?.use { input ->
-                            FileOutputStream(cachedFile).use { output ->
-                                input.copyTo(output)
-                            }
-                        }
-                    }
-                    localPdfFile = cachedFile
-                    isDownloading = false
-                } else {
-                    val f = if (pdfSource.startsWith("file://")) {
+                val targetFile: File = when {
+                    pdfSource.startsWith("http://") || pdfSource.startsWith("https://") -> {
+                        // 1. Check if the file is already downloaded in public Downloads or cache
+                        var foundFile: File? = null
                         try {
-                            File(Uri.parse(pdfSource).path ?: pdfSource.removePrefix("file://"))
+                            val candidateName = resolvedTitle.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
+                            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                            val f1 = File(downloadsDir, resolvedTitle)
+                            val f2 = File(downloadsDir, candidateName)
+                            val f3 = File(downloadsDir, "$candidateName.pdf")
+                            when {
+                                f1.exists() && f1.length() > 512 -> foundFile = f1
+                                f2.exists() && f2.length() > 512 -> foundFile = f2
+                                f3.exists() && f3.length() > 512 -> foundFile = f3
+                            }
                         } catch (e: Exception) {
-                            File(pdfSource.removePrefix("file://"))
+                            e.printStackTrace()
                         }
-                    } else {
-                        File(pdfSource)
+
+                        if (foundFile != null) {
+                            if (DocxToPdfConverter.isWordOrOfficeDocument(foundFile.name, null) || FileImportHelper.isDocxZip(foundFile)) {
+                                DocxToPdfConverter.convertToPdf(context, foundFile, resolvedTitle)
+                            } else {
+                                FileImportHelper.sanitizePdfFile(foundFile)
+                            }
+                        } else {
+                            // Download using CookieManager & UserAgent into app cache
+                            val prepared = FileImportHelper.importAndPrepareDocument(context, Uri.parse(pdfSource), resolvedTitle)
+                            prepared?.first ?: throw IllegalStateException("Could not load document from web.")
+                        }
                     }
-                    if (f.exists() && f.length() > 0) {
-                        localPdfFile = f
-                        isDownloading = false
-                    } else {
-                        errorMessage = "PDF document not found on this device."
-                        isDownloading = false
+                    pdfSource.startsWith("content://") -> {
+                        val uri = Uri.parse(pdfSource)
+                        val prepared = FileImportHelper.importAndPrepareDocument(context, uri, resolvedTitle)
+                        prepared?.first ?: throw IllegalStateException("Could not read document from external app.")
+                    }
+                    else -> {
+                        val f = if (pdfSource.startsWith("file://")) {
+                            try {
+                                File(Uri.parse(pdfSource).path ?: pdfSource.removePrefix("file://"))
+                            } catch (e: Exception) {
+                                File(pdfSource.removePrefix("file://"))
+                            }
+                        } else {
+                            File(pdfSource)
+                        }
+
+                        if (f.exists() && f.length() > 0) {
+                            if (DocxToPdfConverter.isWordOrOfficeDocument(f.name, null) || FileImportHelper.isDocxZip(f)) {
+                                DocxToPdfConverter.convertToPdf(context, f, resolvedTitle)
+                            } else {
+                                FileImportHelper.sanitizePdfFile(f)
+                            }
+                        } else {
+                            val uri = Uri.parse(pdfSource)
+                            val prepared = FileImportHelper.importAndPrepareDocument(context, uri, resolvedTitle)
+                            prepared?.first ?: throw IllegalStateException("PDF file not found on device.")
+                        }
                     }
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                errorMessage = "Could not load document: ${e.localizedMessage ?: "Network error"}"
-                isDownloading = false
-            }
-        }
-    }
 
-    // Initialize PdfRenderEngine
-    LaunchedEffect(localPdfFile) {
-        val file = localPdfFile ?: return@LaunchedEffect
-        withContext(Dispatchers.IO) {
-            try {
-                renderEngine?.close()
-                val engine = PdfRenderEngine(file, screenDensity)
+                val engine = PdfRenderEngine(targetFile, screenDensity)
                 renderEngine = engine
                 pageCount = engine.pageCount
                 currentPageIndex = 0
+                localPdfFile = targetFile
+                isDownloading = false
             } catch (e: Exception) {
                 e.printStackTrace()
-                errorMessage = "Invalid or encrypted PDF file format."
+                errorMessage = "Document Error: ${e.localizedMessage ?: "Invalid or encrypted document format"}"
+                isDownloading = false
             }
         }
     }
@@ -679,8 +637,8 @@ fun PdfViewerScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(
-                                    top = if (barsVisible) 88.dp else 20.dp,
-                                    bottom = if (barsVisible) 72.dp else 16.dp,
+                                    top = if (barsVisible) topBarNotchSafePadding + 46.dp else safeCutout,
+                                    bottom = if (barsVisible) 68.dp else 16.dp,
                                     start = 8.dp,
                                     end = 8.dp
                                 )
@@ -700,7 +658,7 @@ fun PdfViewerScreen(
                                 translationY = panOffsetY
                             },
                         contentPadding = PaddingValues(
-                            top = if (barsVisible) 96.dp else 36.dp,
+                            top = if (barsVisible) topBarNotchSafePadding + 48.dp else safeCutout,
                             bottom = 40.dp
                         ),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -839,8 +797,7 @@ fun PdfViewerScreen(
             exit = fadeOut(animationSpec = tween(220)) + slideOutVertically(animationSpec = tween(220)) { -it },
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .windowInsetsPadding(WindowInsets.statusBars.union(WindowInsets.displayCutout))
-                .padding(top = 10.dp)
+                .padding(top = topBarNotchSafePadding + 2.dp)
         ) {
             Surface(
                 shape = RoundedCornerShape(20.dp),
@@ -875,15 +832,15 @@ fun PdfViewerScreen(
         }
 
         // FLOATING TOP BAR - LIQUID GLASS
+        // Positioned cleanly after the camera notch with a dedicated visible gap of 3px
         AnimatedVisibility(
             visible = barsVisible,
             enter = fadeIn(animationSpec = tween(220)) + slideInVertically(initialOffsetY = { -it }),
             exit = fadeOut(animationSpec = tween(220)) + slideOutVertically(targetOffsetY = { -it }),
             modifier = Modifier
                 .fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.statusBars.union(WindowInsets.displayCutout))
                 .padding(horizontal = 14.dp)
-                .padding(top = 10.dp, bottom = 8.dp)
+                .padding(top = topBarNotchSafePadding, bottom = 8.dp)
                 .align(Alignment.TopCenter)
         ) {
             Row(

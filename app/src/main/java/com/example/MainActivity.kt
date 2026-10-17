@@ -88,11 +88,17 @@ import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 
+import android.content.Intent
+import android.net.Uri
+import android.provider.OpenableColumns
+
 class MainActivity : ComponentActivity() {
     private var webViewInstance: WebView? = null
+    private var incomingPdfUri by mutableStateOf<Uri?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handleIntent(intent)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         enableEdgeToEdge()
         setContent {
@@ -100,8 +106,50 @@ class MainActivity : ComponentActivity() {
                 WebViewScreen(
                     url = "https://study-verse-lime.vercel.app/",
                     savedState = savedInstanceState,
+                    initialPdfUri = incomingPdfUri,
+                    onClearIncomingPdf = { incomingPdfUri = null },
                     onWebViewCreated = { webViewInstance = it }
                 )
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action
+        if (action == Intent.ACTION_VIEW || action == Intent.ACTION_SEND || action == Intent.ACTION_EDIT) {
+            val uri: Uri? = intent.data
+                ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+                ?: if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+                }
+
+            if (uri != null) {
+                try {
+                    if (uri.scheme == "content") {
+                        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                } catch (e: Exception) {
+                    // Ignore non-persistable URIs
+                }
+
+                val mimeType = intent.type ?: try { contentResolver.getType(uri) } catch (e: Exception) { null }
+                val isPdf = mimeType?.contains("pdf", ignoreCase = true) == true ||
+                            uri.toString().contains(".pdf", ignoreCase = true) ||
+                            (uri.scheme == "file" && uri.path?.endsWith(".pdf", ignoreCase = true) == true) ||
+                            action == Intent.ACTION_VIEW
+                if (isPdf) {
+                    incomingPdfUri = uri
+                }
             }
         }
     }
@@ -179,6 +227,8 @@ class WebAppInterface(
 fun WebViewScreen(
     url: String,
     savedState: Bundle? = null,
+    initialPdfUri: Uri? = null,
+    onClearIncomingPdf: () -> Unit = {},
     onWebViewCreated: (WebView) -> Unit = {}
 ) {
     var webView: WebView? by remember { mutableStateOf(null) }
@@ -193,6 +243,31 @@ fun WebViewScreen(
     // Inbuilt PDF Opener State
     var activePdfSource by remember { mutableStateOf<String?>(null) }
     var activePdfTitle by remember { mutableStateOf<String?>(null) }
+
+    val context = LocalContext.current
+
+    // Handle incoming PDF from external apps / file manager / downloads
+    LaunchedEffect(initialPdfUri) {
+        if (initialPdfUri != null) {
+            val displayName = try {
+                if (initialPdfUri.scheme == "content") {
+                    context.contentResolver.query(initialPdfUri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (colIdx != -1) cursor.getString(colIdx) else null
+                        } else null
+                    }
+                } else {
+                    initialPdfUri.lastPathSegment
+                }
+            } catch (e: Exception) {
+                null
+            } ?: "Document.pdf"
+            activePdfSource = initialPdfUri.toString()
+            activePdfTitle = displayName
+            onClearIncomingPdf()
+        }
+    }
 
     // Site redeployment / white screen cache-busting recovery
     var lastSiteUpdateRecovery by remember { mutableStateOf(0L) }
@@ -222,10 +297,10 @@ fun WebViewScreen(
     }
 
     val coroutineScope = rememberCoroutineScope()
-    val context = LocalContext.current
     val isOnline by NetworkMonitor.observeNetwork(context).collectAsState(initial = NetworkMonitor.isOnline(context))
 
     fun triggerSiteUpdateRecovery(reason: String) {
+        if (activePdfSource != null) return
         val now = System.currentTimeMillis()
         if (now - lastSiteUpdateRecovery > 7000) {
             lastSiteUpdateRecovery = now
@@ -612,11 +687,13 @@ fun WebViewScreen(
                                 dm?.enqueue(request)
                                 Toast.makeText(ctx, "StudyVerse: Downloading $finalFileName to Downloads...", Toast.LENGTH_LONG).show()
 
-                                // Load PDF in inbuilt PDF viewer with Liquid Glass UI
+                                // Load PDF in inbuilt PDF viewer with Liquid Glass UI if not already viewing a document
                                 if (isPdf || finalFileName.endsWith(".pdf", ignoreCase = true)) {
                                     (ctx as? Activity)?.runOnUiThread {
-                                        activePdfSource = downloadUrl
-                                        activePdfTitle = finalFileName
+                                        if (activePdfSource == null) {
+                                            activePdfSource = downloadUrl
+                                            activePdfTitle = finalFileName
+                                        }
                                     }
                                 }
                             } catch (e: Exception) {
@@ -685,17 +762,21 @@ fun WebViewScreen(
                                     userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
                                 }
                                 newWebView.webChromeClient = this
-                                newWebView.webViewClient = object : WebViewClient() {
+                                 newWebView.webViewClient = object : WebViewClient() {
                                     override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
                                         val targetUrl = req?.url?.toString() ?: return false
                                         if (targetUrl.endsWith(".pdf", ignoreCase = true) || 
                                             (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("html"))) {
                                             (ctx as? Activity)?.runOnUiThread {
-                                                activePdfSource = targetUrl
-                                                activePdfTitle = URLUtil.guessFileName(targetUrl, null, "application/pdf")
+                                                if (activePdfSource == null) {
+                                                    activePdfSource = targetUrl
+                                                    activePdfTitle = URLUtil.guessFileName(targetUrl, null, "application/pdf")
+                                                }
                                             }
                                         } else {
-                                            view.loadUrl(targetUrl)
+                                            if (activePdfSource == null) {
+                                                view.loadUrl(targetUrl)
+                                            }
                                         }
                                         return true
                                     }
@@ -706,11 +787,15 @@ fun WebViewScreen(
                                         if (targetUrl.endsWith(".pdf", ignoreCase = true) || 
                                             (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("html"))) {
                                             (ctx as? Activity)?.runOnUiThread {
-                                                activePdfSource = targetUrl
-                                                activePdfTitle = URLUtil.guessFileName(targetUrl, null, "application/pdf")
+                                                if (activePdfSource == null) {
+                                                    activePdfSource = targetUrl
+                                                    activePdfTitle = URLUtil.guessFileName(targetUrl, null, "application/pdf")
+                                                }
                                             }
                                         } else {
-                                            view.loadUrl(targetUrl)
+                                            if (activePdfSource == null) {
+                                                view.loadUrl(targetUrl)
+                                            }
                                         }
                                         return true
                                     }
@@ -773,15 +858,21 @@ fun WebViewScreen(
 
                             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                                 val requestUrl = request?.url?.toString() ?: return false
+                                if (activePdfSource != null) {
+                                    return true
+                                }
                                 currentLoadedUrl = requestUrl
 
                                 if (requestUrl.endsWith(".pdf", ignoreCase = true) || 
                                     (requestUrl.contains(".pdf", ignoreCase = true) && !requestUrl.contains("html"))) {
                                     val guessName = URLUtil.guessFileName(requestUrl, null, "application/pdf")
                                     (ctx as? Activity)?.runOnUiThread {
-                                        activePdfSource = requestUrl
-                                        activePdfTitle = guessName
+                                        if (activePdfSource == null) {
+                                            activePdfSource = requestUrl
+                                            activePdfTitle = guessName
+                                        }
                                     }
+                                    view?.stopLoading()
                                     return true
                                 }
 
@@ -824,15 +915,21 @@ fun WebViewScreen(
                             @Suppress("DEPRECATION")
                             override fun shouldOverrideUrlLoading(view: WebView?, urlStr: String?): Boolean {
                                 if (urlStr == null) return false
+                                if (activePdfSource != null) {
+                                    return true
+                                }
                                 currentLoadedUrl = urlStr
 
                                 if (urlStr.endsWith(".pdf", ignoreCase = true) || 
                                     (urlStr.contains(".pdf", ignoreCase = true) && !urlStr.contains("html"))) {
                                     val guessName = URLUtil.guessFileName(urlStr, null, "application/pdf")
                                     (ctx as? Activity)?.runOnUiThread {
-                                        activePdfSource = urlStr
-                                        activePdfTitle = guessName
+                                        if (activePdfSource == null) {
+                                            activePdfSource = urlStr
+                                            activePdfTitle = guessName
+                                        }
                                     }
+                                    view?.stopLoading()
                                     return true
                                 }
 
@@ -957,7 +1054,7 @@ fun WebViewScreen(
 
                                 // White screen / React blank body crash safety check after 1.5s
                                 view?.postDelayed({
-                                    if (!hasError && !isLoading) {
+                                    if (!hasError && !isLoading && activePdfSource == null) {
                                         view.evaluateJavascript("""
                                             (function() {
                                                 var body = document.body;
@@ -970,7 +1067,7 @@ fun WebViewScreen(
                                                 return 'OK';
                                             })();
                                         """.trimIndent()) { result ->
-                                            if (result != null && result.contains("BLANK")) {
+                                            if (result != null && result.contains("BLANK") && activePdfSource == null) {
                                                 triggerSiteUpdateRecovery("blank_body_after_load")
                                             }
                                         }

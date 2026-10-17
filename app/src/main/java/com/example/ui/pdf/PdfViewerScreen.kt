@@ -72,6 +72,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -160,8 +161,11 @@ fun PdfViewerScreen(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var lastTapTime by remember { mutableLongStateOf(0L) }
 
+    var zoomAnimJob by remember { mutableStateOf<Job?>(null) }
+
     fun animateZoomAndPan(targetZoom: Float, targetPanX: Float = 0f, targetPanY: Float = 0f) {
-        coroutineScope.launch {
+        zoomAnimJob?.cancel()
+        zoomAnimJob = coroutineScope.launch {
             val startZoom = zoomScale
             val startPanX = panOffsetX
             val startPanY = panOffsetY
@@ -208,28 +212,67 @@ fun PdfViewerScreen(
 
     // Document download & resolver worker
     LaunchedEffect(pdfSource) {
+        localPdfFile = null
+        try {
+            renderEngine?.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        renderEngine = null
+        pageCount = 0
+        currentPageIndex = 0
+        zoomScale = 1f
+        panOffsetX = 0f
+        panOffsetY = 0f
         isDownloading = true
         errorMessage = null
+
         withContext(Dispatchers.IO) {
             try {
                 if (pdfSource.startsWith("http://") || pdfSource.startsWith("https://")) {
                     val pdfCacheDir = File(context.cacheDir, "study_pdfs").apply { mkdirs() }
+                    // Generate a unique MD5 hash of the URL to prevent cross-document cache collision
+                    val urlHash = java.security.MessageDigest.getInstance("MD5")
+                        .digest(pdfSource.toByteArray())
+                        .joinToString("") { "%02x".format(it) }
                     val safeName = resolvedTitle.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
-                    val cachedFile = File(pdfCacheDir, safeName)
+                    val cachedFile = File(pdfCacheDir, "${urlHash}_$safeName")
 
                     if (cachedFile.exists() && cachedFile.length() > 1024) {
                         localPdfFile = cachedFile
                         isDownloading = false
                     } else {
-                        val url = URL(pdfSource)
-                        val connection = url.openConnection() as HttpURLConnection
+                        var currentUrl = pdfSource
+                        var connection = URL(currentUrl).openConnection() as HttpURLConnection
                         connection.connectTimeout = 15000
-                        connection.readTimeout = 20000
-                        connection.connect()
+                        connection.readTimeout = 25000
+                        connection.instanceFollowRedirects = true
+                        var redirectCount = 0
+                        while (redirectCount < 5) {
+                            connection.connect()
+                            val responseCode = connection.responseCode
+                            if (responseCode in 300..399) {
+                                val newLocation = connection.getHeaderField("Location") ?: break
+                                currentUrl = if (newLocation.startsWith("http://") || newLocation.startsWith("https://")) {
+                                    newLocation
+                                } else {
+                                    URL(URL(currentUrl), newLocation).toString()
+                                }
+                                connection.disconnect()
+                                connection = URL(currentUrl).openConnection() as HttpURLConnection
+                                connection.connectTimeout = 15000
+                                connection.readTimeout = 25000
+                                connection.instanceFollowRedirects = true
+                                redirectCount++
+                            } else {
+                                break
+                            }
+                        }
 
                         val fileLength = connection.contentLength
                         val input: InputStream = connection.inputStream
-                        val output = FileOutputStream(cachedFile)
+                        val tempFile = File(pdfCacheDir, "${cachedFile.name}.tmp")
+                        val output = FileOutputStream(tempFile)
 
                         val data = ByteArray(8192)
                         var total: Long = 0
@@ -244,17 +287,28 @@ fun PdfViewerScreen(
                         output.flush()
                         output.close()
                         input.close()
+                        connection.disconnect()
 
+                        if (tempFile.exists() && tempFile.length() > 512) {
+                            tempFile.renameTo(cachedFile)
+                        }
                         localPdfFile = cachedFile
                         isDownloading = false
                     }
                 } else if (pdfSource.startsWith("content://")) {
                     val uri = Uri.parse(pdfSource)
                     val pdfCacheDir = File(context.cacheDir, "study_pdfs").apply { mkdirs() }
-                    val cachedFile = File(pdfCacheDir, "imported_${System.currentTimeMillis()}.pdf")
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(cachedFile).use { output ->
-                            input.copyTo(output)
+                    val uriHash = java.security.MessageDigest.getInstance("MD5")
+                        .digest(pdfSource.toByteArray())
+                        .joinToString("") { "%02x".format(it) }
+                    val safeName = resolvedTitle.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
+                    val cachedFile = File(pdfCacheDir, "${uriHash}_$safeName")
+                    
+                    if (!cachedFile.exists() || cachedFile.length() <= 1024) {
+                        context.contentResolver.openInputStream(uri)?.use { input ->
+                            FileOutputStream(cachedFile).use { output ->
+                                input.copyTo(output)
+                            }
                         }
                     }
                     localPdfFile = cachedFile
@@ -294,7 +348,7 @@ fun PdfViewerScreen(
         }
     }
 
-    DisposableEffect(Unit) {
+    DisposableEffect(renderEngine) {
         onDispose {
             renderEngine?.close()
         }
@@ -464,26 +518,15 @@ fun PdfViewerScreen(
                                         zoomScale = targetZoom
                                         panOffsetX = panOffsetX + focalShiftX + panDelta.x
 
-                                        if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
-                                            panOffsetY = 0f
-                                            if (panDelta.y != 0f) {
-                                                listState.dispatchRawDelta(-panDelta.y)
-                                            }
-                                        } else {
-                                            val focusY = centroid.y - centerY
-                                            val focalShiftY = (focusY - panOffsetY) * (1f - scaleRatio)
-                                            panOffsetY = panOffsetY + focalShiftY + panDelta.y
-                                        }
+                                        val focusY = centroid.y - centerY
+                                        val focalShiftY = (focusY - panOffsetY) * (1f - scaleRatio)
+                                        val maxFlowPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + 160f)
+                                        panOffsetY = (panOffsetY + focalShiftY + panDelta.y).coerceIn(-maxFlowPanY, maxFlowPanY)
                                     } else if (panDelta != Offset.Zero) {
-                                        panOffsetX += panDelta.x
-                                        if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
-                                            panOffsetY = 0f
-                                            if (panDelta.y != 0f) {
-                                                listState.dispatchRawDelta(-panDelta.y)
-                                            }
-                                        } else {
-                                            panOffsetY += panDelta.y
-                                        }
+                                        val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 80f)
+                                        val maxFlowPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + 160f)
+                                        panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
+                                        panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxFlowPanY, maxFlowPanY)
                                     }
 
                                     // Intercept and consume so underlying pager does not scroll during pinch
@@ -500,16 +543,35 @@ fun PdfViewerScreen(
                                         if (dist > touchSlop || hasMoved) {
                                             val panDelta = event.calculatePan()
                                             if (panDelta != Offset.Zero) {
+                                                val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 80f)
+                                                panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
+
                                                 if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
-                                                    // In Flow mode: Directly scroll list up/down seamlessly through all pages
+                                                    // In Flow mode: Seamless list scrolling + vertical top/bottom panning
+                                                    val maxFlowPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + 160f)
                                                     if (panDelta.y != 0f) {
-                                                        listState.dispatchRawDelta(-panDelta.y)
+                                                        val canScrollBack = listState.canScrollBackward
+                                                        val canScrollFwd = listState.canScrollForward
+
+                                                        if (panDelta.y > 0f) {
+                                                            // Swiping finger DOWN (revealing top content of page)
+                                                            if (!canScrollBack || panOffsetY < maxFlowPanY) {
+                                                                panOffsetY = (panOffsetY + panDelta.y).coerceAtMost(maxFlowPanY)
+                                                            } else {
+                                                                val consumed = listState.dispatchRawDelta(panDelta.y)
+                                                                if (consumed == 0f) {
+                                                                    panOffsetY = (panOffsetY + panDelta.y).coerceAtMost(maxFlowPanY)
+                                                                }
+                                                            }
+                                                        } else {
+                                                            // Swiping finger UP (moving down through document)
+                                                            if (panOffsetY > -maxFlowPanY) {
+                                                                panOffsetY = (panOffsetY + panDelta.y).coerceAtLeast(-maxFlowPanY)
+                                                            } else if (canScrollFwd) {
+                                                                listState.dispatchRawDelta(panDelta.y)
+                                                            }
+                                                        }
                                                     }
-                                                    if (panDelta.x != 0f) {
-                                                        val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 80f)
-                                                        panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
-                                                    }
-                                                    panOffsetY = 0f
                                                 } else {
                                                     // In Page Swipe mode: Pan inside the current page
                                                     val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 80f)
@@ -528,7 +590,7 @@ fun PdfViewerScreen(
 
                             // Snap-back bounds checking on finger release
                             val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
-                            val maxPanY = if (viewMode == PdfViewMode.CONTINUOUS_FLOW) 0f else max(0f, (ch * (zoomScale - 1f)) / 2f)
+                            val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + if (viewMode == PdfViewMode.CONTINUOUS_FLOW) 160f else 0f)
 
                             if (zoomScale < 1.0f) {
                                 animateZoomAndPan(1f, 0f, 0f)
@@ -536,11 +598,11 @@ fun PdfViewerScreen(
                                 animateZoomAndPan(
                                     5.0f,
                                     panOffsetX.coerceIn(-maxPanX, maxPanX),
-                                    if (viewMode == PdfViewMode.CONTINUOUS_FLOW) 0f else panOffsetY.coerceIn(-maxPanY, maxPanY)
+                                    panOffsetY.coerceIn(-maxPanY, maxPanY)
                                 )
                             } else if (zoomScale > 1.05f) {
                                 val clampedX = panOffsetX.coerceIn(-maxPanX, maxPanX)
-                                val clampedY = if (viewMode == PdfViewMode.CONTINUOUS_FLOW) 0f else panOffsetY.coerceIn(-maxPanY, maxPanY)
+                                val clampedY = panOffsetY.coerceIn(-maxPanY, maxPanY)
                                 if (clampedX != panOffsetX || clampedY != panOffsetY) {
                                     animateZoomAndPan(zoomScale, clampedX, clampedY)
                                 }
@@ -557,14 +619,10 @@ fun PdfViewerScreen(
                                             animateZoomAndPan(1f, 0f, 0f)
                                         } else {
                                             val focusX = downPos.x - centerX
+                                            val focusY = downPos.y - centerY
                                             val targetPanX = (-focusX * 1.25f).coerceIn(-cw * 0.625f, cw * 0.625f)
-                                            if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
-                                                animateZoomAndPan(2.25f, targetPanX, 0f)
-                                            } else {
-                                                val focusY = downPos.y - centerY
-                                                val targetPanY = (-focusY * 1.25f).coerceIn(-ch * 0.625f, ch * 0.625f)
-                                                animateZoomAndPan(2.25f, targetPanX, targetPanY)
-                                            }
+                                            val targetPanY = (-focusY * 1.25f).coerceIn(-ch * 0.625f, ch * 0.625f)
+                                            animateZoomAndPan(2.25f, targetPanX, targetPanY)
                                         }
                                     } else {
                                         lastTapTime = upTime
@@ -621,14 +679,14 @@ fun PdfViewerScreen(
                     // CONTINUOUS VERTICAL FLOW
                     LazyColumn(
                         state = listState,
-                        userScrollEnabled = true,
+                        userScrollEnabled = zoomScale <= 1.05f,
                         modifier = Modifier
                             .fillMaxSize()
                             .graphicsLayer {
                                 scaleX = zoomScale
                                 scaleY = zoomScale
                                 translationX = panOffsetX
-                                translationY = 0f
+                                translationY = panOffsetY
                             },
                         contentPadding = PaddingValues(
                             top = if (barsVisible && zoomScale <= 1.05f) 80.dp else 32.dp,
@@ -906,13 +964,30 @@ fun PdfViewerScreen(
                         onClick = {
                             val file = localPdfFile
                             if (file != null && file.exists()) {
-                                try {
-                                    val target = File(
-                                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                                        resolvedTitle
-                                    )
-                                    file.copyTo(target, overwrite = true)
-                                    Toast.makeText(context, "Saved to Downloads: ${target.name}", Toast.LENGTH_SHORT).show()
+                                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                                        val contentValues = android.content.ContentValues().apply {
+                                            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, resolvedTitle)
+                                            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+                                            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                                        }
+                                        val uri = context.contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
+                                        if (uri != null) {
+                                            context.contentResolver.openOutputStream(uri)?.use { output ->
+                                                file.inputStream().use { input -> input.copyTo(output) }
+                                            }
+                                            Toast.makeText(context, "Saved to Downloads: $resolvedTitle", Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            Toast.makeText(context, "Failed to create file in Downloads", Toast.LENGTH_SHORT).show()
+                                        }
+                                    } else {
+                                        @Suppress("DEPRECATION")
+                                        val target = File(
+                                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                                            resolvedTitle
+                                        )
+                                        file.copyTo(target, overwrite = true)
+                                        Toast.makeText(context, "Saved to Downloads: ${target.name}", Toast.LENGTH_SHORT).show()
+                                    }
                                 } catch (e: Exception) {
                                     e.printStackTrace()
                                     Toast.makeText(context, "Save failed: ${e.message}", Toast.LENGTH_SHORT).show()

@@ -39,7 +39,7 @@ fun PdfSinglePageView(
     isSwipeMode: Boolean = true,
     modifier: Modifier = Modifier
 ) {
-    var pageBitmap by remember(pageIndex) { mutableStateOf<Bitmap?>(null) }
+    var pageBitmap by remember(pageIndex, engine) { mutableStateOf<Bitmap?>(null) }
 
     LaunchedEffect(pageIndex, engine) {
         val bmp = engine.getPageBitmap(pageIndex)
@@ -70,9 +70,11 @@ fun PdfSinglePageView(
                             .clip(RoundedCornerShape(10.dp))
                             .background(Color.White)
                     } else {
+                        val aspect = (bmp.width.toFloat() / bmp.height.toFloat().coerceAtLeast(1f)).coerceIn(0.2f, 5f)
                         Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 8.dp, vertical = 6.dp)
+                            .aspectRatio(aspect)
                             .shadow(
                                 elevation = 8.dp,
                                 shape = RoundedCornerShape(10.dp),
@@ -89,7 +91,7 @@ fun PdfSinglePageView(
                         contentDescription = "Page ${pageIndex + 1}",
                         contentScale = if (isSwipeMode) ContentScale.Fit else ContentScale.FillWidth,
                         colorFilter = colorFilter,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = if (isSwipeMode) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
                     )
                 }
             } else {

@@ -77,16 +77,13 @@ class PdfRenderEngine(
     }
 
     /**
-     * Retrieves or rasterizes the page bitmap using compressed RGB_565 graphics.
+     * Retrieves or rasterizes the page bitmap cleanly without thread contention.
      */
     suspend fun getPageBitmap(pageIndex: Int): Bitmap? = withContext(Dispatchers.IO) {
         if (pageIndex < 0 || pageIndex >= pageCount) return@withContext null
 
         // Fast-path cache lookup
-        cache.get(pageIndex)?.let { cached ->
-            triggerPrefetch(pageIndex)
-            return@withContext cached
-        }
+        cache.get(pageIndex)?.let { return@withContext it }
 
         renderMutex.withLock {
             // Re-check after acquiring lock
@@ -96,35 +93,25 @@ class PdfRenderEngine(
             try {
                 val page = rend.openPage(pageIndex)
 
-                // High-efficiency compressed graphics calculation:
-                // Target width ~760dp to 960px max is ideal for razor-sharp reading on mobile screens
-                // without bloating texture memory.
                 val baseWidth = page.width
                 val baseHeight = page.height
                 val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat().coerceAtLeast(1f)
 
-                val targetWidth = (baseWidth * screenDensity * 0.85f).roundToInt().coerceIn(480, 960)
-                val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(600, 1600)
+                val targetWidth = (baseWidth * screenDensity * 0.85f).roundToInt().coerceIn(480, 1080)
+                val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(600, 1920)
 
-                // PdfRenderer requires ARGB_8888 for initial rasterization
-                val tempBmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-                val canvas = Canvas(tempBmp)
+                val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bmp)
                 canvas.drawColor(Color.WHITE)
-                page.render(tempBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                 page.close()
 
-                // Compress to RGB_565: 2 bytes per pixel, 50% less RAM, instant GPU texture transfer
-                val compressedBmp = tempBmp.copy(Bitmap.Config.RGB_565, false) ?: tempBmp
-                if (compressedBmp !== tempBmp) {
-                    tempBmp.recycle()
-                }
+                cache.put(pageIndex, bmp)
 
-                cache.put(pageIndex, compressedBmp)
-
-                // Prefetch neighboring pages in background
+                // Trigger background prefetch asynchronously without blocking current page
                 triggerPrefetch(pageIndex)
 
-                compressedBmp
+                bmp
             } catch (oom: OutOfMemoryError) {
                 cache.evictAll()
                 System.gc()
@@ -137,38 +124,37 @@ class PdfRenderEngine(
     }
 
     /**
-     * Asynchronously pre-renders adjacent pages so swiping is seamless and zero-lag.
+     * Asynchronously pre-renders adjacent pages when engine is idle.
      */
     private fun triggerPrefetch(currentIndex: Int) {
         scope.launch {
-            val prefetchIndices = listOf(currentIndex + 1, currentIndex - 1, currentIndex + 2)
+            val prefetchIndices = listOf(currentIndex + 1, currentIndex - 1)
             for (idx in prefetchIndices) {
                 if (idx in 0 until pageCount && cache.get(idx) == null) {
-                    renderMutex.withLock {
-                        if (cache.get(idx) == null && renderer != null) {
-                            try {
-                                val rend = renderer ?: return@withLock
+                    // Try to lock; if main thread is rendering a page, skip prefetching to avoid delay
+                    if (renderMutex.tryLock()) {
+                        try {
+                            if (cache.get(idx) == null && renderer != null) {
+                                val rend = renderer ?: break
                                 val page = rend.openPage(idx)
                                 val baseWidth = page.width
                                 val baseHeight = page.height
                                 val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat().coerceAtLeast(1f)
-                                val targetWidth = (baseWidth * screenDensity * 0.85f).roundToInt().coerceIn(480, 960)
-                                val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(600, 1600)
+                                val targetWidth = (baseWidth * screenDensity * 0.85f).roundToInt().coerceIn(480, 1080)
+                                val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(600, 1920)
 
-                                val tempBmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-                                val canvas = Canvas(tempBmp)
+                                val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                                val canvas = Canvas(bmp)
                                 canvas.drawColor(Color.WHITE)
-                                page.render(tempBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                                 page.close()
 
-                                val compressedBmp = tempBmp.copy(Bitmap.Config.RGB_565, false) ?: tempBmp
-                                if (compressedBmp !== tempBmp) {
-                                    tempBmp.recycle()
-                                }
-                                cache.put(idx, compressedBmp)
-                            } catch (_: Throwable) {
-                                // Ignore non-critical prefetch errors
+                                cache.put(idx, bmp)
                             }
+                        } catch (_: Throwable) {
+                            // Non-critical prefetch error
+                        } finally {
+                            renderMutex.unlock()
                         }
                     }
                 }

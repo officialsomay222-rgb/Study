@@ -314,9 +314,13 @@ fun PdfViewerScreen(
         }
     }
 
-    DisposableEffect(renderEngine) {
+    DisposableEffect(Unit) {
         onDispose {
-            renderEngine?.close()
+            try {
+                renderEngine?.close()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
     }
 

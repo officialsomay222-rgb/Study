@@ -314,8 +314,16 @@ fun PdfViewerScreen(
                     localPdfFile = cachedFile
                     isDownloading = false
                 } else {
-                    val f = File(pdfSource)
-                    if (f.exists()) {
+                    val f = if (pdfSource.startsWith("file://")) {
+                        try {
+                            File(Uri.parse(pdfSource).path ?: pdfSource.removePrefix("file://"))
+                        } catch (e: Exception) {
+                            File(pdfSource.removePrefix("file://"))
+                        }
+                    } else {
+                        File(pdfSource)
+                    }
+                    if (f.exists() && f.length() > 0) {
                         localPdfFile = f
                         isDownloading = false
                     } else {
@@ -479,7 +487,9 @@ fun PdfViewerScreen(
                     .onSizeChanged { containerSize = it }
                     .pointerInput(Unit) {
                         awaitEachGesture {
+                            zoomAnimJob?.cancel()
                             val firstDown = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            zoomAnimJob?.cancel()
                             val downTime = System.currentTimeMillis()
                             val downPos = firstDown.position
                             var isMultiTouch = false
@@ -497,6 +507,7 @@ fun PdfViewerScreen(
                                 val count = activePointers.size
 
                                 if (count >= 2) {
+                                    zoomAnimJob?.cancel()
                                     // TWO-FINGER GESTURE: Dynamic centroid focal-point pinch-to-zoom & pan
                                     isMultiTouch = true
                                     hasMoved = true
@@ -520,11 +531,11 @@ fun PdfViewerScreen(
 
                                         val focusY = centroid.y - centerY
                                         val focalShiftY = (focusY - panOffsetY) * (1f - scaleRatio)
-                                        val maxFlowPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + 160f)
+                                        val maxFlowPanY = max(0f, ch * (zoomScale - 1f) * 0.75f + 400f)
                                         panOffsetY = (panOffsetY + focalShiftY + panDelta.y).coerceIn(-maxFlowPanY, maxFlowPanY)
                                     } else if (panDelta != Offset.Zero) {
-                                        val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 80f)
-                                        val maxFlowPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + 160f)
+                                        val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 120f)
+                                        val maxFlowPanY = max(0f, ch * (zoomScale - 1f) * 0.75f + 400f)
                                         panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
                                         panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxFlowPanY, maxFlowPanY)
                                     }
@@ -543,12 +554,12 @@ fun PdfViewerScreen(
                                         if (dist > touchSlop || hasMoved) {
                                             val panDelta = event.calculatePan()
                                             if (panDelta != Offset.Zero) {
-                                                val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 80f)
+                                                val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f + 120f)
                                                 panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
 
                                                 if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
                                                     // In Flow mode: Seamless list scrolling + vertical top/bottom panning
-                                                    val maxFlowPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + 160f)
+                                                    val maxFlowPanY = max(0f, ch * (zoomScale - 1f) * 0.75f + 400f)
                                                     if (panDelta.y != 0f) {
                                                         val canScrollBack = listState.canScrollBackward
                                                         val canScrollFwd = listState.canScrollForward
@@ -590,7 +601,7 @@ fun PdfViewerScreen(
 
                             // Snap-back bounds checking on finger release
                             val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
-                            val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f + if (viewMode == PdfViewMode.CONTINUOUS_FLOW) 160f else 0f)
+                            val maxPanY = max(0f, if (viewMode == PdfViewMode.CONTINUOUS_FLOW) (ch * (zoomScale - 1f) * 0.75f + 200f) else (ch * (zoomScale - 1f)) / 2f)
 
                             if (zoomScale < 1.0f) {
                                 animateZoomAndPan(1f, 0f, 0f)
@@ -668,8 +679,8 @@ fun PdfViewerScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(
-                                    top = if (barsVisible && zoomScale <= 1.05f) 72.dp else 16.dp,
-                                    bottom = if (barsVisible && zoomScale <= 1.05f) 72.dp else 16.dp,
+                                    top = if (barsVisible) 72.dp else 16.dp,
+                                    bottom = if (barsVisible) 72.dp else 16.dp,
                                     start = 8.dp,
                                     end = 8.dp
                                 )
@@ -689,7 +700,7 @@ fun PdfViewerScreen(
                                 translationY = panOffsetY
                             },
                         contentPadding = PaddingValues(
-                            top = if (barsVisible && zoomScale <= 1.05f) 80.dp else 32.dp,
+                            top = if (barsVisible) 80.dp else 32.dp,
                             bottom = 40.dp
                         ),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -964,6 +975,7 @@ fun PdfViewerScreen(
                         onClick = {
                             val file = localPdfFile
                             if (file != null && file.exists()) {
+                                try {
                                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                                         val contentValues = android.content.ContentValues().apply {
                                             put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, resolvedTitle)

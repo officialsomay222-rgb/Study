@@ -679,7 +679,7 @@ fun PdfViewerScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(
-                                    top = if (barsVisible) 72.dp else 16.dp,
+                                    top = if (barsVisible) 88.dp else 20.dp,
                                     bottom = if (barsVisible) 72.dp else 16.dp,
                                     start = 8.dp,
                                     end = 8.dp
@@ -700,7 +700,7 @@ fun PdfViewerScreen(
                                 translationY = panOffsetY
                             },
                         contentPadding = PaddingValues(
-                            top = if (barsVisible) 80.dp else 32.dp,
+                            top = if (barsVisible) 96.dp else 36.dp,
                             bottom = 40.dp
                         ),
                         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -839,8 +839,8 @@ fun PdfViewerScreen(
             exit = fadeOut(animationSpec = tween(220)) + slideOutVertically(animationSpec = tween(220)) { -it },
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(top = 16.dp)
+                .windowInsetsPadding(WindowInsets.statusBars.union(WindowInsets.displayCutout))
+                .padding(top = 10.dp)
         ) {
             Surface(
                 shape = RoundedCornerShape(20.dp),
@@ -881,8 +881,9 @@ fun PdfViewerScreen(
             exit = fadeOut(animationSpec = tween(220)) + slideOutVertically(targetOffsetY = { -it }),
             modifier = Modifier
                 .fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(horizontal = 14.dp, vertical = 10.dp)
+                .windowInsetsPadding(WindowInsets.statusBars.union(WindowInsets.displayCutout))
+                .padding(horizontal = 14.dp)
+                .padding(top = 10.dp, bottom = 8.dp)
                 .align(Alignment.TopCenter)
         ) {
             Row(

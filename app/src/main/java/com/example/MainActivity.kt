@@ -95,6 +95,7 @@ import android.provider.OpenableColumns
 class MainActivity : ComponentActivity() {
     private var webViewInstance: WebView? = null
     private var incomingPdfUri by mutableStateOf<Uri?>(null)
+    private var incomingPdfName by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -107,7 +108,11 @@ class MainActivity : ComponentActivity() {
                     url = "https://study-verse-lime.vercel.app/",
                     savedState = savedInstanceState,
                     initialPdfUri = incomingPdfUri,
-                    onClearIncomingPdf = { incomingPdfUri = null },
+                    initialPdfTitle = incomingPdfName,
+                    onClearIncomingPdf = {
+                        incomingPdfUri = null
+                        incomingPdfName = null
+                    },
                     onWebViewCreated = { webViewInstance = it }
                 )
             }
@@ -134,21 +139,66 @@ class MainActivity : ComponentActivity() {
                 }
 
             if (uri != null) {
-                try {
-                    if (uri.scheme == "content") {
-                        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
-                } catch (e: Exception) {
-                    // Ignore non-persistable URIs
-                }
-
                 val mimeType = intent.type ?: try { contentResolver.getType(uri) } catch (e: Exception) { null }
                 val isPdf = mimeType?.contains("pdf", ignoreCase = true) == true ||
                             uri.toString().contains(".pdf", ignoreCase = true) ||
                             (uri.scheme == "file" && uri.path?.endsWith(".pdf", ignoreCase = true) == true) ||
-                            action == Intent.ACTION_VIEW
+                            action == Intent.ACTION_VIEW || action == Intent.ACTION_SEND
+
                 if (isPdf) {
-                    incomingPdfUri = uri
+                    try {
+                        val displayName = try {
+                            if (uri.scheme == "content") {
+                                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                                    if (cursor.moveToFirst()) {
+                                        val colIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                        if (colIdx != -1) cursor.getString(colIdx) else null
+                                    } else null
+                                }
+                            } else {
+                                uri.lastPathSegment
+                            }
+                        } catch (e: Exception) {
+                            null
+                        } ?: "Document.pdf"
+
+                        val cacheFolder = java.io.File(cacheDir, "study_pdfs").apply { mkdirs() }
+                        val safeName = displayName.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
+                        val finalFileName = if (safeName.endsWith(".pdf", ignoreCase = true)) safeName else "$safeName.pdf"
+                        val localFile = java.io.File(cacheFolder, "ext_${System.currentTimeMillis()}_$finalFileName")
+
+                        if (uri.scheme == "file") {
+                            val rawPath = uri.path ?: uri.toString().removePrefix("file://")
+                            val srcFile = java.io.File(rawPath)
+                            if (srcFile.exists() && srcFile.length() > 0) {
+                                srcFile.copyTo(localFile, overwrite = true)
+                            } else {
+                                contentResolver.openInputStream(uri)?.use { input ->
+                                    java.io.FileOutputStream(localFile).use { output ->
+                                        input.copyTo(output)
+                                    }
+                                }
+                            }
+                        } else {
+                            contentResolver.openInputStream(uri)?.use { input ->
+                                java.io.FileOutputStream(localFile).use { output ->
+                                    input.copyTo(output)
+                                }
+                            }
+                        }
+
+                        if (localFile.exists() && localFile.length() > 0) {
+                            incomingPdfUri = Uri.fromFile(localFile)
+                            incomingPdfName = displayName
+                        } else {
+                            incomingPdfUri = uri
+                            incomingPdfName = displayName
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        incomingPdfUri = uri
+                        incomingPdfName = null
+                    }
                 }
             }
         }
@@ -228,6 +278,7 @@ fun WebViewScreen(
     url: String,
     savedState: Bundle? = null,
     initialPdfUri: Uri? = null,
+    initialPdfTitle: String? = null,
     onClearIncomingPdf: () -> Unit = {},
     onWebViewCreated: (WebView) -> Unit = {}
 ) {
@@ -249,7 +300,7 @@ fun WebViewScreen(
     // Handle incoming PDF from external apps / file manager / downloads
     LaunchedEffect(initialPdfUri) {
         if (initialPdfUri != null) {
-            val displayName = try {
+            val displayName = initialPdfTitle ?: try {
                 if (initialPdfUri.scheme == "content") {
                     context.contentResolver.query(initialPdfUri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
                         if (cursor.moveToFirst()) {
@@ -263,7 +314,7 @@ fun WebViewScreen(
             } catch (e: Exception) {
                 null
             } ?: "Document.pdf"
-            activePdfSource = initialPdfUri.toString()
+            activePdfSource = if (initialPdfUri.scheme == "file") initialPdfUri.path else initialPdfUri.toString()
             activePdfTitle = displayName
             onClearIncomingPdf()
         }

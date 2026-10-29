@@ -1,15 +1,8 @@
 package com.example.ui.pdf
 
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -19,6 +12,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -31,13 +26,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.shadow
@@ -51,8 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * Ultra-premium Liquid Glass button with specular rim, translucent frosted body,
- * and glowing neon accents.
+ * Refined matte-satin glass button with clean borders and zero visual noise.
  */
 @Composable
 fun LiquidGlassButton(
@@ -62,22 +53,22 @@ fun LiquidGlassButton(
     text: String? = null,
     contentDescription: String? = text ?: "Action Button",
     enabled: Boolean = true,
-    accentColor: Color = Color(0xFF00E5FF),
+    accentColor: Color = Color(0xFF38BDF8),
     isPill: Boolean = false,
     isActive: Boolean = false
 ) {
-    val alphaMultiplier = if (enabled) 1f else 0.4f
-    val shape = if (isPill) RoundedCornerShape(24.dp) else CircleShape
-    val effectiveAccent = if (isActive) Color(0xFF00E5FF) else accentColor
+    val alphaMultiplier = if (enabled) 1f else 0.42f
+    val shape = if (isPill) RoundedCornerShape(22.dp) else CircleShape
+    val effectiveAccent = if (isActive) Color(0xFF38BDF8) else accentColor
 
     Surface(
         onClick = { if (enabled) onClick() },
         modifier = modifier
             .shadow(
-                elevation = if (isActive) 12.dp else 6.dp,
+                elevation = if (isActive) 8.dp else 5.dp,
                 shape = shape,
-                ambientColor = effectiveAccent.copy(alpha = if (isActive) 0.45f else 0.2f),
-                spotColor = effectiveAccent.copy(alpha = if (isActive) 0.6f else 0.3f)
+                ambientColor = Color.Black.copy(alpha = 0.45f),
+                spotColor = Color.Black.copy(alpha = 0.55f)
             ),
         shape = shape,
         color = Color.Transparent,
@@ -88,20 +79,18 @@ fun LiquidGlassButton(
                 .background(
                     Brush.verticalGradient(
                         colors = listOf(
-                            if (isActive) Color.White.copy(alpha = 0.35f) else Color.White.copy(alpha = 0.20f * alphaMultiplier),
-                            if (isActive) Color(0xFF1E3A5F).copy(alpha = 0.75f) else Color(0xFF161F36).copy(alpha = 0.65f * alphaMultiplier),
-                            if (isActive) Color(0xFF0C192E).copy(alpha = 0.95f) else Color(0xFF0A0F1E).copy(alpha = 0.90f * alphaMultiplier)
+                            if (isActive) Color(0xFF1E324E).copy(alpha = 0.96f) else Color(0xFF1A2234).copy(alpha = 0.92f * alphaMultiplier),
+                            if (isActive) Color(0xFF111C2E).copy(alpha = 0.98f) else Color(0xFF0E1422).copy(alpha = 0.96f * alphaMultiplier)
                         )
                     )
                 )
                 .border(
                     BorderStroke(
-                        if (isActive) 1.5.dp else 1.1.dp,
-                        Brush.linearGradient(
+                        if (isActive) 1.3.dp else 1.dp,
+                        Brush.verticalGradient(
                             colors = listOf(
-                                Color.White.copy(alpha = if (isActive) 0.85f else 0.65f * alphaMultiplier),
-                                effectiveAccent.copy(alpha = if (isActive) 0.8f else 0.4f * alphaMultiplier),
-                                Color.White.copy(alpha = 0.15f * alphaMultiplier)
+                                if (isActive) effectiveAccent.copy(alpha = 0.75f) else Color.White.copy(alpha = 0.24f * alphaMultiplier),
+                                if (isActive) effectiveAccent.copy(alpha = 0.35f) else Color.White.copy(alpha = 0.08f * alphaMultiplier)
                             )
                         )
                     ),
@@ -121,7 +110,7 @@ fun LiquidGlassButton(
                     Icon(
                         imageVector = icon,
                         contentDescription = contentDescription,
-                        tint = if (isActive) Color(0xFF00E5FF) else Color.White.copy(alpha = alphaMultiplier),
+                        tint = if (isActive) Color(0xFF38BDF8) else Color.White.copy(alpha = 0.92f * alphaMultiplier),
                         modifier = Modifier.size(19.dp)
                     )
                 }
@@ -129,9 +118,9 @@ fun LiquidGlassButton(
                     if (icon != null) Spacer(modifier = Modifier.width(6.dp))
                     Text(
                         text = text,
-                        color = if (isActive) Color(0xFF00E5FF) else Color.White.copy(alpha = alphaMultiplier),
+                        color = if (isActive) Color(0xFF38BDF8) else Color.White.copy(alpha = 0.95f * alphaMultiplier),
                         fontSize = 12.5.sp,
-                        fontWeight = FontWeight.Bold,
+                        fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -142,9 +131,8 @@ fun LiquidGlassButton(
 }
 
 /**
- * Refined Minimalist Floating Liquid Glass Orb (Ball) anchored in bottom-right corner.
- * Features ultra-smooth spring physics, liquid ripple wave on opening, rotating morph icon,
- * and high-end 3D specular glass highlights.
+ * Refined Minimalist Floating Control Ball anchored in the bottom-right corner.
+ * Crafted with a clean matte-obsidian & satin-titanium finish — NO sparking lights or neon flashing.
  */
 @Composable
 fun LiquidGlassOrbButton(
@@ -152,192 +140,151 @@ fun LiquidGlassOrbButton(
     isOpen: Boolean,
     modifier: Modifier = Modifier,
     pageText: String? = null,
-    accentColor: Color = Color(0xFF00E5FF)
+    accentColor: Color = Color(0xFF38BDF8)
 ) {
-    // Ambient breathing pulse when closed
-    val infiniteTransition = rememberInfiniteTransition(label = "orbPulse")
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 0.96f,
-        targetValue = 1.04f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(2200),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulseScale"
-    )
-
-    // Fluid spring rotation for the icon (0 deg when closed -> 180 deg when open)
     val iconRotation by animateFloatAsState(
-        targetValue = if (isOpen) 180f else 0f,
+        targetValue = if (isOpen) 90f else 0f,
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMediumLow
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = Spring.StiffnessMedium
         ),
         label = "iconRotation"
     )
 
-    // Ball scale animation when opened vs closed
     val orbScale by animateFloatAsState(
-        targetValue = if (isOpen) 1.08f else 1f,
+        targetValue = if (isOpen) 1.05f else 1f,
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
+            dampingRatio = Spring.DampingRatioNoBouncy,
             stiffness = Spring.StiffnessMedium
         ),
         label = "orbScale"
     )
-
-    // Expanding liquid ripple ring effect when opening
-    val rippleProgress = remember { Animatable(0f) }
-
-    LaunchedEffect(isOpen) {
-        if (isOpen) {
-            rippleProgress.snapTo(0f)
-            rippleProgress.animateTo(
-                targetValue = 1f,
-                animationSpec = tween(durationMillis = 400, easing = FastOutSlowInEasing)
-            )
-        } else {
-            rippleProgress.snapTo(0f)
-        }
-    }
-
-    val rippleScale = 0.8f + (rippleProgress.value * 1.5f)
-    val rippleAlpha = (1f - rippleProgress.value) * 0.75f
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.End,
         modifier = modifier
     ) {
-        // Minimalist companion glass page badge
+        // Companion page counter badge (only shown in PDF reader when closed)
         if (pageText != null && !isOpen) {
             Surface(
-                shape = RoundedCornerShape(16.dp),
+                shape = RoundedCornerShape(18.dp),
                 color = Color.Transparent,
                 modifier = Modifier
                     .padding(end = 10.dp)
-                    .shadow(6.dp, RoundedCornerShape(16.dp), spotColor = accentColor.copy(alpha = 0.35f))
+                    .shadow(8.dp, RoundedCornerShape(18.dp), spotColor = Color.Black.copy(alpha = 0.6f))
             ) {
                 Box(
                     modifier = Modifier
                         .background(
                             Brush.verticalGradient(
                                 listOf(
-                                    Color.White.copy(alpha = 0.24f),
-                                    Color(0xFF131A2D).copy(alpha = 0.85f),
-                                    Color(0xFF080D1A).copy(alpha = 0.94f)
+                                    Color(0xFF1B2436).copy(alpha = 0.95f),
+                                    Color(0xFF0E1420).copy(alpha = 0.98f)
                                 )
                             )
                         )
                         .border(
                             BorderStroke(
-                                1.1.dp,
-                                Brush.linearGradient(
+                                1.dp,
+                                Brush.verticalGradient(
                                     listOf(
-                                        Color.White.copy(alpha = 0.65f),
-                                        accentColor.copy(alpha = 0.45f)
+                                        Color.White.copy(alpha = 0.24f),
+                                        Color.White.copy(alpha = 0.08f)
                                     )
                                 )
                             ),
-                            RoundedCornerShape(16.dp)
+                            RoundedCornerShape(18.dp)
                         )
-                        .padding(horizontal = 11.dp, vertical = 6.dp)
+                        .padding(horizontal = 12.dp, vertical = 7.dp)
                 ) {
                     Text(
                         text = pageText,
-                        color = Color.White,
+                        color = Color(0xFFE2E8F0),
                         fontSize = 11.5.sp,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 0.3.sp
                     )
                 }
             }
         }
 
-        // The Floating Glass Orb / Ball
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier.size(64.dp)
+        // Clean Satin-Obsidian Floating Ball (No sparking lights or neon aura)
+        Surface(
+            onClick = onClick,
+            modifier = Modifier
+                .size(54.dp)
+                .scale(orbScale)
+                .shadow(
+                    elevation = 14.dp,
+                    shape = CircleShape,
+                    ambientColor = Color.Black.copy(alpha = 0.65f),
+                    spotColor = Color.Black.copy(alpha = 0.8f)
+                ),
+            shape = CircleShape,
+            color = Color.Transparent
         ) {
-            // Liquid ripple shockwave on opening
-            if (rippleAlpha > 0.02f) {
-                Box(
-                    modifier = Modifier
-                        .size(60.dp)
-                        .scale(rippleScale)
-                        .border(
-                            BorderStroke(2.dp, accentColor.copy(alpha = rippleAlpha)),
-                            CircleShape
-                        )
-                )
-            }
-
-            // Ambient glowing aura
             Box(
                 modifier = Modifier
-                    .size(60.dp)
-                    .scale(if (isOpen) orbScale * 1.1f else pulseScale)
+                    .fillMaxSize()
                     .background(
-                        Brush.radialGradient(
+                        Brush.verticalGradient(
                             listOf(
-                                accentColor.copy(alpha = if (isOpen) 0.55f else 0.28f),
-                                Color(0xFF7C4DFF).copy(alpha = if (isOpen) 0.35f else 0.15f),
-                                Color.Transparent
+                                if (isOpen) Color(0xFF23324C) else Color(0xFF1E293B),
+                                if (isOpen) Color(0xFF131D31) else Color(0xFF0F172A),
+                                Color(0xFF090D16)
+                            )
+                        )
+                    )
+                    .border(
+                        BorderStroke(
+                            1.2.dp,
+                            Brush.verticalGradient(
+                                listOf(
+                                    if (isOpen) accentColor.copy(alpha = 0.65f) else Color.White.copy(alpha = 0.32f),
+                                    Color.White.copy(alpha = 0.10f)
+                                )
                             )
                         ),
-                        CircleShape
-                    )
-            )
-
-            // Glass sphere surface with 3D specular highlight
-            Surface(
-                onClick = onClick,
-                modifier = Modifier
-                    .size(56.dp)
-                    .scale(orbScale)
-                    .shadow(
-                        elevation = if (isOpen) 18.dp else 12.dp,
-                        shape = CircleShape,
-                        ambientColor = accentColor.copy(alpha = if (isOpen) 0.55f else 0.35f),
-                        spotColor = accentColor.copy(alpha = if (isOpen) 0.75f else 0.5f)
+                        shape = CircleShape
                     ),
-                shape = CircleShape,
-                color = Color.Transparent
+                contentAlignment = Alignment.Center
             ) {
+                // Subtle top-inner satin glass rim (static, non-sparkling)
                 Box(
                     modifier = Modifier
-                        .fillMaxSize()
+                        .align(Alignment.TopCenter)
+                        .padding(top = 3.dp)
+                        .width(26.dp)
+                        .height(8.dp)
+                        .clip(CircleShape)
                         .background(
                             Brush.verticalGradient(
                                 listOf(
-                                    if (isOpen) Color.White.copy(alpha = 0.50f) else Color.White.copy(alpha = 0.35f),
-                                    if (isOpen) Color(0xFF1E4273).copy(alpha = 0.90f) else Color(0xFF15223D).copy(alpha = 0.85f),
-                                    if (isOpen) Color(0xFF0C1B33).copy(alpha = 0.98f) else Color(0xFF090E1B).copy(alpha = 0.95f)
+                                    Color.White.copy(alpha = 0.16f),
+                                    Color.Transparent
                                 )
                             )
                         )
-                        .border(
-                            BorderStroke(
-                                if (isOpen) 2.dp else 1.5.dp,
-                                Brush.sweepGradient(
-                                    listOf(
-                                        Color.White.copy(alpha = 0.95f),
-                                        accentColor.copy(alpha = if (isOpen) 1f else 0.85f),
-                                        Color(0xFF7C4DFF).copy(alpha = 0.70f),
-                                        Color.White.copy(alpha = 0.35f),
-                                        Color.White.copy(alpha = 0.95f)
-                                    )
-                                )
-                            ),
-                            shape = CircleShape
+                )
+
+                // Inner ring + crisp icon
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (isOpen) accentColor.copy(alpha = 0.14f)
+                            else Color.White.copy(alpha = 0.04f)
                         ),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = if (isOpen) Icons.Default.Close else Icons.Default.Tune,
                         contentDescription = if (isOpen) "Close Controls" else "Open Controls",
-                        tint = if (isOpen) Color(0xFF00E5FF) else Color.White,
+                        tint = if (isOpen) accentColor else Color(0xFFF1F5F9),
                         modifier = Modifier
-                            .size(24.dp)
+                            .size(21.dp)
                             .rotate(iconRotation)
                     )
                 }
@@ -347,8 +294,7 @@ fun LiquidGlassOrbButton(
 }
 
 /**
- * Attractive Frosted Glass Blur Backdrop that adapts black or white styling
- * according to the active PDF Theme.
+ * Clean Frosted Backdrop that adapts to the active PDF Theme.
  */
 @Composable
 fun LiquidGlassBackdrop(
@@ -359,23 +305,20 @@ fun LiquidGlassBackdrop(
     val scrimBrush = when (paperTheme) {
         PaperTheme.CLEAN_WHITE -> Brush.verticalGradient(
             listOf(
-                Color.White.copy(alpha = 0.55f),
-                Color(0xFFE8EEF5).copy(alpha = 0.65f),
-                Color(0xFF090D1A).copy(alpha = 0.58f)
+                Color(0xFF0F172A).copy(alpha = 0.35f),
+                Color(0xFF090D16).copy(alpha = 0.55f)
             )
         )
         PaperTheme.WARM_SEPIA -> Brush.verticalGradient(
             listOf(
-                Color(0xFF38291E).copy(alpha = 0.68f),
-                Color(0xFF241810).copy(alpha = 0.80f),
-                Color(0xFF150E09).copy(alpha = 0.88f)
+                Color(0xFF241810).copy(alpha = 0.55f),
+                Color(0xFF150E09).copy(alpha = 0.75f)
             )
         )
         PaperTheme.DARK_MODE -> Brush.verticalGradient(
             listOf(
-                Color(0xFF070B14).copy(alpha = 0.78f),
-                Color(0xFF000000).copy(alpha = 0.88f),
-                Color(0xFF000000).copy(alpha = 0.94f)
+                Color(0xFF070B14).copy(alpha = 0.65f),
+                Color(0xFF000000).copy(alpha = 0.82f)
             )
         )
     }

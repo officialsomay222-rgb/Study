@@ -96,6 +96,27 @@ import android.provider.OpenableColumns
 import androidx.core.content.ContextCompat
 import com.example.util.FileImportHelper
 import com.example.ui.pdf.DocxToPdfConverter
+import com.example.ui.pdf.LiquidGlassOrbButton
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.SwipeVertical
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.style.TextOverflow
 
 class MainActivity : ComponentActivity() {
     private var webViewInstance: WebView? = null
@@ -198,7 +219,9 @@ class WebAppInterface(
     private val onColorReceived: (String) -> Unit,
     private val onSettingsUpdateReceived: (String) -> Unit = {},
     private val onChunkLoadErrorReceived: (String) -> Unit = {},
-    private val onBlankContentReceived: () -> Unit = {}
+    private val onBlankContentReceived: () -> Unit = {},
+    private val onScrollStateChanged: (Boolean) -> Unit = {},
+    private val onScrollDirectionChanged: (Boolean) -> Unit = {}
 ) {
     @android.webkit.JavascriptInterface
     fun postThemeColor(colorString: String) {
@@ -219,6 +242,16 @@ class WebAppInterface(
     fun onBlankContent() {
         onBlankContentReceived()
     }
+
+    @android.webkit.JavascriptInterface
+    fun reportScrollState(scrolledDown: Boolean) {
+        onScrollStateChanged(scrolledDown)
+    }
+
+    @android.webkit.JavascriptInterface
+    fun reportScrollDirection(scrollingDown: Boolean) {
+        onScrollDirectionChanged(scrollingDown)
+    }
 }
 
 @Composable
@@ -230,8 +263,12 @@ fun WebViewScreen(
     onClearIncomingPdf: () -> Unit = {},
     onWebViewCreated: (WebView) -> Unit = {}
 ) {
+    val context = LocalContext.current
+    val studyPrefs = remember { context.getSharedPreferences("StudyVersePrefs", Context.MODE_PRIVATE) }
+
     var webView: WebView? by remember { mutableStateOf(null) }
     var canGoBack by remember { mutableStateOf(false) }
+    var canGoForward by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(true) }
     var progress by remember { mutableStateOf(0f) }
     var hasError by remember { mutableStateOf(false) }
@@ -239,11 +276,36 @@ fun WebViewScreen(
     var currentLoadedUrl by remember { mutableStateOf(url) }
     var isPullToRefreshRuleEnabled by remember { mutableStateOf(true) }
 
+    // User-controlled Swipe to Refresh Switch (OFF by default so scrolling up never accidentally reloads & wipes content)
+    var userSwipeToRefreshEnabled by remember {
+        mutableStateOf(studyPrefs.getBoolean("user_swipe_to_refresh_enabled", false))
+    }
+    // Deep DOM scroll state reported from passive JS listeners inside WebView (catches React/Next.js inner scroll containers)
+    var isWebPageScrolledDown by remember { mutableStateOf(false) }
+    // Tracks whether the current touch gesture began while the page was already at the very top
+    var touchStartedAtTop by remember { mutableStateOf(true) }
+    // Floating Ball visibility: hides underneath when scrolling down, comes back up when scrolling up
+    var isWebBallVisible by remember { mutableStateOf(true) }
+    // Floating Ball menu state on WebView screen
+    var isWebOrbMenuOpen by remember { mutableStateOf(false) }
+
+    // Do NOT show the Web Floating Ball on the 1st site (study-verse-lime.vercel.app)
+    val isFirstStudyLimeSite = remember(currentLoadedUrl) {
+        val lower = currentLoadedUrl.lowercase()
+        lower.isBlank() || lower.contains("study-verse-lime.vercel.app")
+    }
+
+    LaunchedEffect(isFirstStudyLimeSite) {
+        if (isFirstStudyLimeSite) {
+            isWebOrbMenuOpen = false
+        } else {
+            isWebBallVisible = true
+        }
+    }
+
     // Inbuilt PDF Opener State
     var activePdfSource by remember { mutableStateOf<String?>(null) }
     var activePdfTitle by remember { mutableStateOf<String?>(null) }
-
-    val context = LocalContext.current
 
     // Handle incoming PDF from external apps / file manager / downloads
     LaunchedEffect(initialPdfUri) {
@@ -282,8 +344,10 @@ fun WebViewScreen(
                                             val uri = Uri.parse(localUri)
                                             val name = fileTitle ?: FileImportHelper.resolveDisplayName(context, uri)
                                             if (name.endsWith(".pdf", ignoreCase = true) || DocxToPdfConverter.isWordOrOfficeDocument(name, null)) {
-                                                activePdfSource = uri.toString()
-                                                activePdfTitle = name
+                                                if (activePdfSource == null) {
+                                                    activePdfSource = uri.toString()
+                                                    activePdfTitle = name
+                                                }
                                             }
                                         }
                                     }
@@ -420,11 +484,13 @@ fun WebViewScreen(
         }
     }
 
-    // Handle system back button for PDF viewer OR custom view (full screen video) OR step-by-step internal WebView navigation
-    BackHandler(enabled = activePdfSource != null || customView != null || canGoBack) {
+    // Handle system back button for PDF viewer OR Web Orb menu OR custom view (full screen video) OR step-by-step internal WebView navigation
+    BackHandler(enabled = activePdfSource != null || isWebOrbMenuOpen || customView != null || canGoBack) {
         if (activePdfSource != null) {
             activePdfSource = null
             activePdfTitle = null
+        } else if (isWebOrbMenuOpen) {
+            isWebOrbMenuOpen = false
         } else if (customView != null) {
             customViewCallback?.onCustomViewHidden()
             customView = null
@@ -437,6 +503,7 @@ fun WebViewScreen(
         } else if (webView?.canGoBack() == true) {
             webView?.goBack()
             canGoBack = webView?.canGoBack() == true
+            canGoForward = webView?.canGoForward() == true
         }
     }
 
@@ -572,7 +639,7 @@ fun WebViewScreen(
                             
                             val isAllowed = pullToRefresh && activePdfSource == null
                             isPullToRefreshRuleEnabled = isAllowed
-                            swipeRefreshLayout.isEnabled = isAllowed
+                            swipeRefreshLayout.isEnabled = isAllowed && userSwipeToRefreshEnabled
                             
                         } catch (e: Exception) {
                             e.printStackTrace()
@@ -587,7 +654,7 @@ fun WebViewScreen(
                             webView.settings.userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
                             val isAllowed = activePdfSource == null
                             isPullToRefreshRuleEnabled = isAllowed
-                            swipeRefreshLayout.isEnabled = isAllowed
+                            swipeRefreshLayout.isEnabled = isAllowed && userSwipeToRefreshEnabled
                         }
                     }
 
@@ -644,6 +711,21 @@ fun WebViewScreen(
                                 (ctx as? Activity)?.runOnUiThread {
                                     triggerSiteUpdateRecovery("blank_body")
                                 }
+                            },
+                            onScrollStateChanged = { scrolledDown ->
+                                isWebPageScrolledDown = scrolledDown
+                                if (scrolledDown) {
+                                    touchStartedAtTop = false
+                                }
+                            },
+                            onScrollDirectionChanged = { scrollingDown ->
+                                (ctx as? Activity)?.runOnUiThread {
+                                    if (scrollingDown) {
+                                        if (!isWebOrbMenuOpen) isWebBallVisible = false
+                                    } else {
+                                        isWebBallVisible = true
+                                    }
+                                }
                             }
                         )
                         addJavascriptInterface(jsInterface, "AndroidApp")
@@ -659,6 +741,46 @@ fun WebViewScreen(
                         overScrollMode = View.OVER_SCROLL_NEVER
                         isVerticalScrollBarEnabled = false
                         isHorizontalScrollBarEnabled = false
+
+                        // Native WebView scroll listener for hiding ball on scroll down & showing on scroll up
+                        setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
+                            if (scrollY > 0) {
+                                isWebPageScrolledDown = true
+                                touchStartedAtTop = false
+                            }
+                            val dy = scrollY - oldScrollY
+                            if (dy > 10 && !isWebOrbMenuOpen) {
+                                isWebBallVisible = false
+                            } else if (dy < -10 || scrollY <= 4) {
+                                isWebBallVisible = true
+                            }
+                        }
+
+                        // Touch listener to lock touchStartedAtTop on ACTION_DOWN so upward scroll never triggers refresh mid-swipe
+                        var lastTouchY = 0f
+                        setOnTouchListener { v, event ->
+                            when (event.actionMasked) {
+                                android.view.MotionEvent.ACTION_DOWN -> {
+                                    lastTouchY = event.y
+                                    val wv = v as? WebView
+                                    val atTopNow = (wv == null || (wv.scrollY <= 0 && !wv.canScrollVertically(-1))) && !isWebPageScrolledDown
+                                    touchStartedAtTop = atTopNow
+                                }
+                                android.view.MotionEvent.ACTION_MOVE -> {
+                                    val dy = event.y - lastTouchY
+                                    if (dy < -18f) {
+                                        // Finger dragging upward -> scrolling page down -> hide ball underneath
+                                        if (!isWebOrbMenuOpen) isWebBallVisible = false
+                                        lastTouchY = event.y
+                                    } else if (dy > 18f) {
+                                        // Finger dragging downward -> scrolling page up -> bring ball back up
+                                        isWebBallVisible = true
+                                        lastTouchY = event.y
+                                    }
+                                }
+                            }
+                            false
+                        }
 
                         settings.apply {
                             javaScriptEnabled = true
@@ -720,27 +842,38 @@ fun WebViewScreen(
                             }
 
                             try {
-                                val request = DownloadManager.Request(android.net.Uri.parse(downloadUrl)).apply {
-                                    setMimeType(finalMimeType)
-                                    addRequestHeader("User-Agent", userAgent)
-                                    val cookie = CookieManager.getInstance().getCookie(downloadUrl)
-                                    if (cookie != null) addRequestHeader("Cookie", cookie)
-                                    setTitle("StudyVerse: $finalFileName")
-                                    setDescription("Downloading $finalFileName...")
-                                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, finalFileName)
-                                }
-                                val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
-                                dm?.enqueue(request)
-                                Toast.makeText(ctx, "StudyVerse: Downloading $finalFileName to Downloads...", Toast.LENGTH_LONG).show()
-
-                                // Load PDF or Word in inbuilt viewer with Liquid Glass UI if not already viewing a document
-                                if (isPdf || isWordDoc || finalFileName.endsWith(".pdf", ignoreCase = true)) {
-                                    (ctx as? Activity)?.runOnUiThread {
-                                        if (activePdfSource == null) {
-                                            activePdfSource = downloadUrl
-                                            activePdfTitle = finalFileName
+                                if (downloadUrl.startsWith("data:", ignoreCase = true)) {
+                                    if (isPdf || isWordDoc || finalFileName.endsWith(".pdf", ignoreCase = true)) {
+                                        (ctx as? Activity)?.runOnUiThread {
+                                            if (activePdfSource == null) {
+                                                activePdfSource = downloadUrl
+                                                activePdfTitle = finalFileName
+                                            }
                                         }
+                                    }
+                                } else if (downloadUrl.startsWith("http://", ignoreCase = true) || downloadUrl.startsWith("https://", ignoreCase = true)) {
+                                    // Open study PDFs and Office documents directly in the inbuilt viewer without race conditions
+                                    if (isPdf || isWordDoc || finalFileName.endsWith(".pdf", ignoreCase = true)) {
+                                        (ctx as? Activity)?.runOnUiThread {
+                                            if (activePdfSource == null) {
+                                                activePdfSource = downloadUrl
+                                                activePdfTitle = finalFileName
+                                            }
+                                        }
+                                    } else {
+                                        val request = DownloadManager.Request(android.net.Uri.parse(downloadUrl)).apply {
+                                            setMimeType(finalMimeType)
+                                            addRequestHeader("User-Agent", userAgent)
+                                            val cookie = CookieManager.getInstance().getCookie(downloadUrl)
+                                            if (cookie != null) addRequestHeader("Cookie", cookie)
+                                            setTitle("StudyVerse: $finalFileName")
+                                            setDescription("Downloading $finalFileName...")
+                                            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, finalFileName)
+                                        }
+                                        val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+                                        dm?.enqueue(request)
+                                        Toast.makeText(ctx, "StudyVerse: Downloading $finalFileName to Downloads...", Toast.LENGTH_LONG).show()
                                     }
                                 }
                             } catch (e: Exception) {
@@ -777,6 +910,7 @@ fun WebViewScreen(
                                     swipeRefreshLayout.isRefreshing = false
                                 }
                                 canGoBack = view?.canGoBack() == true
+                                canGoForward = view?.canGoForward() == true
                             }
 
                             override fun onCreateWindow(
@@ -1029,48 +1163,144 @@ fun WebViewScreen(
                             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                                 super.doUpdateVisitedHistory(view, url, isReload)
                                 canGoBack = view?.canGoBack() == true
+                                canGoForward = view?.canGoForward() == true
                                 if (url != null) currentLoadedUrl = url
                                 view?.let { webView ->
                                     applyDynamicSettings(url, webView)
                                 }
                             }
 
+                            private fun installScrollAndSafetyGuard(view: WebView?) {
+                                val scrollGuardScript = """
+                                    (function() {
+                                        if (!window.__studyverse_safety_guard_installed) {
+                                            window.__studyverse_safety_guard_installed = true;
+                                            window.addEventListener('error', function(e) {
+                                                var msg = (e && e.message) ? e.message : '';
+                                                if (msg.indexOf('Loading chunk') !== -1 || 
+                                                    msg.indexOf('ChunkLoadError') !== -1 || 
+                                                    msg.indexOf('Failed to fetch dynamically imported module') !== -1 ||
+                                                    msg.indexOf('css chunk') !== -1) {
+                                                    if (window.AndroidApp && window.AndroidApp.onChunkLoadError) {
+                                                        window.AndroidApp.onChunkLoadError(msg);
+                                                    }
+                                                }
+                                            }, true);
+                                            window.addEventListener('unhandledrejection', function(e) {
+                                                var reason = (e && e.reason && e.reason.message) ? e.reason.message : '';
+                                                if (reason.indexOf('Chunk') !== -1 || reason.indexOf('module') !== -1) {
+                                                    if (window.AndroidApp && window.AndroidApp.onChunkLoadError) {
+                                                        window.AndroidApp.onChunkLoadError(reason);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        if (!window.__studyverse_scroll_guard_installed) {
+                                            window.__studyverse_scroll_guard_installed = true;
+                                            var lastReportedScrolled = null;
+                                            var scrolledTargets = [];
+                                            var lastScrollPosMap = new WeakMap();
+                                            var lastWinScroll = 0;
+
+                                            function getWinScroll() {
+                                                return (window.pageYOffset || window.scrollY || (document.documentElement && document.documentElement.scrollTop) || (document.body && document.body.scrollTop) || 0);
+                                            }
+
+                                            function checkAnyScrolled(target) {
+                                                if (getWinScroll() > 1) return true;
+                                                var el = target;
+                                                while (el && el !== document && el !== window) {
+                                                    if (el.scrollTop && el.scrollTop > 1) return true;
+                                                    el = el.parentElement;
+                                                }
+                                                for (var i = scrolledTargets.length - 1; i >= 0; i--) {
+                                                    var node = scrolledTargets[i];
+                                                    if (!node || !node.isConnected) {
+                                                        scrolledTargets.splice(i, 1);
+                                                    } else if (node.scrollTop > 1) {
+                                                        return true;
+                                                    }
+                                                }
+                                                var containers = document.querySelectorAll('main, [data-radix-scroll-area-viewport], .overflow-y-auto, .overflow-auto');
+                                                for (var j = 0; j < containers.length; j++) {
+                                                    if (containers[j].scrollTop > 1) return true;
+                                                }
+                                                return false;
+                                            }
+
+                                            function onScrollCapture(e) {
+                                                var t = e ? e.target : null;
+                                                if (t && t !== document && t !== window && t.scrollTop !== undefined) {
+                                                    if (scrolledTargets.indexOf(t) === -1) {
+                                                        scrolledTargets.push(t);
+                                                    }
+                                                    var prev = lastScrollPosMap.get(t) || 0;
+                                                    var cur = t.scrollTop || 0;
+                                                    if (cur - prev > 8) {
+                                                        if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
+                                                            window.AndroidApp.reportScrollDirection(true);
+                                                        }
+                                                    } else if (cur - prev < -8 || cur <= 2) {
+                                                        if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
+                                                            window.AndroidApp.reportScrollDirection(false);
+                                                        }
+                                                    }
+                                                    lastScrollPosMap.set(t, cur);
+                                                } else {
+                                                    var curWin = getWinScroll();
+                                                    if (curWin - lastWinScroll > 8) {
+                                                        if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
+                                                            window.AndroidApp.reportScrollDirection(true);
+                                                        }
+                                                    } else if (curWin - lastWinScroll < -8 || curWin <= 2) {
+                                                        if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
+                                                            window.AndroidApp.reportScrollDirection(false);
+                                                        }
+                                                    }
+                                                    lastWinScroll = curWin;
+                                                }
+                                                var scrolled = checkAnyScrolled(t);
+                                                if (scrolled !== lastReportedScrolled) {
+                                                    lastReportedScrolled = scrolled;
+                                                    if (window.AndroidApp && window.AndroidApp.reportScrollState) {
+                                                        window.AndroidApp.reportScrollState(scrolled);
+                                                    }
+                                                }
+                                            }
+
+                                            function onTouchCapture(e) {
+                                                var t = e ? e.target : null;
+                                                var scrolled = checkAnyScrolled(t);
+                                                if (scrolled !== lastReportedScrolled) {
+                                                    lastReportedScrolled = scrolled;
+                                                    if (window.AndroidApp && window.AndroidApp.reportScrollState) {
+                                                        window.AndroidApp.reportScrollState(scrolled);
+                                                    }
+                                                }
+                                            }
+
+                                            window.addEventListener('scroll', onScrollCapture, { capture: true, passive: true });
+                                            window.addEventListener('touchstart', onTouchCapture, { capture: true, passive: true });
+                                            window.addEventListener('touchmove', onTouchCapture, { capture: true, passive: true });
+                                        }
+                                    })();
+                                """.trimIndent()
+                                view?.evaluateJavascript(scrollGuardScript, null)
+                            }
+
                             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                                 super.onPageStarted(view, url, favicon)
                                 isLoading = true
                                 progress = 0f
+                                isWebPageScrolledDown = false
+                                isWebBallVisible = true
                                 if (url != null) currentLoadedUrl = url
                                 
                                 view?.let { webView ->
                                     applyDynamicSettings(url, webView)
                                 }
 
-                                // Install runtime ChunkLoadError listener early
-                                view?.evaluateJavascript("""
-                                    (function() {
-                                        if (window.__studyverse_safety_guard_installed) return;
-                                        window.__studyverse_safety_guard_installed = true;
-                                        window.addEventListener('error', function(e) {
-                                            var msg = (e && e.message) ? e.message : '';
-                                            if (msg.indexOf('Loading chunk') !== -1 || 
-                                                msg.indexOf('ChunkLoadError') !== -1 || 
-                                                msg.indexOf('Failed to fetch dynamically imported module') !== -1 ||
-                                                msg.indexOf('css chunk') !== -1) {
-                                                if (window.AndroidApp && window.AndroidApp.onChunkLoadError) {
-                                                    window.AndroidApp.onChunkLoadError(msg);
-                                                }
-                                            }
-                                        }, true);
-                                        window.addEventListener('unhandledrejection', function(e) {
-                                            var reason = (e && e.reason && e.reason.message) ? e.reason.message : '';
-                                            if (reason.indexOf('Chunk') !== -1 || reason.indexOf('module') !== -1) {
-                                                if (window.AndroidApp && window.AndroidApp.onChunkLoadError) {
-                                                    window.AndroidApp.onChunkLoadError(reason);
-                                                }
-                                            }
-                                        });
-                                    })();
-                                """.trimIndent(), null)
+                                installScrollAndSafetyGuard(view)
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
@@ -1078,7 +1308,9 @@ fun WebViewScreen(
                                 isLoading = false
                                 swipeRefreshLayout.isRefreshing = false
                                 canGoBack = view?.canGoBack() == true
+                                canGoForward = view?.canGoForward() == true
                                 if (url != null) currentLoadedUrl = url
+                                installScrollAndSafetyGuard(view)
                                 
                                 // Send theme color to match system bars
                                 view?.evaluateJavascript("""
@@ -1203,20 +1435,27 @@ fun WebViewScreen(
                     )
 
                     // Strict Child Scroll Up Callback:
-                    // Return true if child can scroll up, which blocks SwipeRefreshLayout from intercepting touches.
-                    // SwipeRefresh is only permitted if WebView is stationary at the true top (scrollY <= 0) AND cannot scroll up (-1).
+                    // Return true if child OR any inner DOM container is scrolled down, if touch did not start at true top,
+                    // or if Swipe-to-Refresh switch is OFF. This guarantees scrolling upward on EVERY website never triggers refresh!
                     swipeRefreshLayout.setOnChildScrollUpCallback { _, _ ->
-                        val child = swipeRefreshLayout.getChildAt(0) as? WebView
-                        if (child == null) {
-                            false
+                        if (!userSwipeToRefreshEnabled || !isPullToRefreshRuleEnabled || activePdfSource != null || !touchStartedAtTop) {
+                            true
                         } else {
-                            child.scrollY > 0 || child.canScrollVertically(-1)
+                            val child = swipeRefreshLayout.getChildAt(0) as? WebView
+                            if (child == null) {
+                                false
+                            } else {
+                                child.scrollY > 0 || child.canScrollVertically(-1) || isWebPageScrolledDown
+                            }
                         }
                     }
 
                     swipeRefreshLayout.setOnRefreshListener {
+                        if (!userSwipeToRefreshEnabled || !touchStartedAtTop || isWebPageScrolledDown) {
+                            swipeRefreshLayout.isRefreshing = false
+                            return@setOnRefreshListener
+                        }
                         hasError = false
-                        // Do NOT clearCache(true); fast reload revalidates assets without heavy redownloads
                         webViewInstance.reload()
                     }
 
@@ -1227,8 +1466,9 @@ fun WebViewScreen(
                     if (childWebView != null) {
                         webView = childWebView
                         canGoBack = childWebView.canGoBack()
+                        canGoForward = childWebView.canGoForward()
                     }
-                    container.isEnabled = isPullToRefreshRuleEnabled && activePdfSource == null
+                    container.isEnabled = userSwipeToRefreshEnabled && isPullToRefreshRuleEnabled && activePdfSource == null
                 },
                 onRelease = { container ->
                     val childWebView = container.getChildAt(0) as? WebView
@@ -1309,6 +1549,155 @@ fun WebViewScreen(
                 exit = fadeOut(animationSpec = tween(350, easing = FastOutSlowInEasing))
             ) {
                 LoadingOverlay(progress = progress)
+            }
+
+            // Scrim when WebView Floating Ball Chrome Menu is open
+            AnimatedVisibility(
+                visible = !isFirstStudyLimeSite && isWebOrbMenuOpen && activePdfSource == null && customView == null && !hasError,
+                enter = fadeIn(animationSpec = tween(180)),
+                exit = fadeOut(animationSpec = tween(160)),
+                modifier = Modifier.fillMaxSize()
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color(0x88040812))
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { isWebOrbMenuOpen = false }
+                )
+            }
+
+            // Expanded Chrome-Style Quick Menu from Floating Ball on WebView Screen
+            AnimatedVisibility(
+                visible = !isFirstStudyLimeSite && isWebOrbMenuOpen && activePdfSource == null && customView == null && !hasError,
+                enter = slideInVertically(
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioNoBouncy,
+                        stiffness = Spring.StiffnessMediumLow
+                    ),
+                    initialOffsetY = { it / 2 }
+                ) + fadeIn(animationSpec = tween(180)) + scaleIn(
+                    animationSpec = spring(
+                        dampingRatio = 0.78f,
+                        stiffness = Spring.StiffnessMediumLow
+                    ),
+                    transformOrigin = TransformOrigin(0.92f, 0.92f)
+                ),
+                exit = slideOutVertically(
+                    animationSpec = tween(180, easing = FastOutSlowInEasing),
+                    targetOffsetY = { it / 2 }
+                ) + fadeOut(animationSpec = tween(150)) + scaleOut(
+                    animationSpec = tween(150),
+                    transformOrigin = TransformOrigin(0.92f, 0.92f)
+                ),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(end = 16.dp, bottom = 84.dp, start = 16.dp)
+            ) {
+                val activeHost = remember(currentLoadedUrl) {
+                    try {
+                        Uri.parse(currentLoadedUrl).host?.removePrefix("www.") ?: "Browser Controls"
+                    } catch (_: Exception) {
+                        "Browser Controls"
+                    }
+                }
+                WebFloatingBallChromeMenu(
+                    siteHost = activeHost,
+                    canGoBack = canGoBack,
+                    canGoForward = canGoForward,
+                    swipeToRefreshEnabled = userSwipeToRefreshEnabled,
+                    onToggleSwipeToRefresh = { enabled ->
+                        userSwipeToRefreshEnabled = enabled
+                        studyPrefs.edit().putBoolean("user_swipe_to_refresh_enabled", enabled).apply()
+                        Toast.makeText(
+                            context,
+                            if (enabled) "Swipe to Refresh Enabled" else "Swipe to Refresh Disabled (Content Protected)",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    },
+                    onRefreshPage = {
+                        isWebOrbMenuOpen = false
+                        hasError = false
+                        isLoading = true
+                        webView?.reload()
+                    },
+                    onGoBack = {
+                        if (webView?.canGoBack() == true) {
+                            webView?.goBack()
+                            canGoBack = webView?.canGoBack() == true
+                            canGoForward = webView?.canGoForward() == true
+                        }
+                        isWebOrbMenuOpen = false
+                    },
+                    onGoForward = {
+                        if (webView?.canGoForward() == true) {
+                            webView?.goForward()
+                            canGoBack = webView?.canGoBack() == true
+                            canGoForward = webView?.canGoForward() == true
+                        }
+                        isWebOrbMenuOpen = false
+                    },
+                    onScrollToTop = {
+                        isWebOrbMenuOpen = false
+                        webView?.evaluateJavascript(
+                            """
+                            (function() {
+                                window.scrollTo({ top: 0, behavior: 'smooth' });
+                                if (document.documentElement) document.documentElement.scrollTop = 0;
+                                if (document.body) document.body.scrollTop = 0;
+                                var containers = document.querySelectorAll('main, [data-radix-scroll-area-viewport], .overflow-y-auto, .overflow-auto');
+                                for (var i = 0; i < containers.length; i++) {
+                                    containers[i].scrollTo({ top: 0, behavior: 'smooth' });
+                                }
+                                if (window.AndroidApp && window.AndroidApp.reportScrollState) {
+                                    window.AndroidApp.reportScrollState(false);
+                                }
+                            })();
+                            """.trimIndent(),
+                            null
+                        )
+                        isWebPageScrolledDown = false
+                        touchStartedAtTop = true
+                    },
+                    onClose = { isWebOrbMenuOpen = false }
+                )
+            }
+
+            // Floating Control Ball on WebView Screen (Hidden on 1st site study-verse-lime;
+            // slides down underneath when scrolling down and slides back up when scrolling up)
+            AnimatedVisibility(
+                visible = !isFirstStudyLimeSite && (isWebBallVisible || isWebOrbMenuOpen) && activePdfSource == null && customView == null && !hasError && !isLoading,
+                enter = slideInVertically(
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioNoBouncy,
+                        stiffness = Spring.StiffnessMediumLow
+                    ),
+                    initialOffsetY = { it * 2 }
+                ) + fadeIn(animationSpec = tween(200)) + scaleIn(
+                    animationSpec = tween(200),
+                    transformOrigin = TransformOrigin(1f, 1f)
+                ),
+                exit = slideOutVertically(
+                    animationSpec = tween(220, easing = FastOutSlowInEasing),
+                    targetOffsetY = { it * 2 }
+                ) + fadeOut(animationSpec = tween(180)) + scaleOut(
+                    animationSpec = tween(180),
+                    transformOrigin = TransformOrigin(1f, 1f)
+                ),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(end = 18.dp, bottom = 18.dp)
+            ) {
+                LiquidGlassOrbButton(
+                    onClick = { isWebOrbMenuOpen = !isWebOrbMenuOpen },
+                    isOpen = isWebOrbMenuOpen,
+                    pageText = null,
+                    accentColor = Color(0xFF38BDF8)
+                )
             }
             
             if (customView != null) {
@@ -1769,3 +2158,302 @@ private fun isNetworkAvailable(context: Context): Boolean {
     val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return false
     return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
 }
+
+/**
+ * Chrome-style compact Floating Ball Menu for WebView with:
+ * - Active site header badge & close button
+ * - Refresh Current Page primary button
+ * - Swipe-to-Refresh Protection Switch (OFF by default so scrolling upward never wipes out page content)
+ * - 3-Column Chrome Quick Navigation Bar (Back, Forward, Scroll Top — no PDF Opener column)
+ */
+@Composable
+fun WebFloatingBallChromeMenu(
+    siteHost: String,
+    canGoBack: Boolean,
+    canGoForward: Boolean,
+    swipeToRefreshEnabled: Boolean,
+    onToggleSwipeToRefresh: (Boolean) -> Unit,
+    onRefreshPage: () -> Unit,
+    onGoBack: () -> Unit,
+    onGoForward: () -> Unit,
+    onScrollToTop: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(26.dp),
+        color = Color.Transparent,
+        modifier = modifier
+            .widthIn(max = 340.dp)
+            .shadow(24.dp, RoundedCornerShape(26.dp), spotColor = Color.Black.copy(alpha = 0.75f))
+    ) {
+        Box(
+            modifier = Modifier
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            Color(0xFF1B2436).copy(alpha = 0.97f),
+                            Color(0xFF101726).copy(alpha = 0.99f),
+                            Color(0xFF0A0F1A)
+                        )
+                    )
+                )
+                .border(
+                    BorderStroke(
+                        1.1.dp,
+                        Brush.verticalGradient(
+                            listOf(
+                                Color.White.copy(alpha = 0.28f),
+                                Color.White.copy(alpha = 0.08f)
+                            )
+                        )
+                    ),
+                    RoundedCornerShape(26.dp)
+                )
+                .padding(horizontal = 16.dp, vertical = 14.dp)
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() }
+                ) { /* Consume clicks inside menu */ }
+        ) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(11.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                // Header: Site Hostname & Close Button
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(9.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(30.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF38BDF8).copy(alpha = 0.14f))
+                                .border(0.8.dp, Color(0xFF38BDF8).copy(alpha = 0.35f), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.School,
+                                contentDescription = null,
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        Column {
+                            Text(
+                                text = siteHost,
+                                color = Color(0xFFF8FAFC),
+                                fontSize = 13.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "Quick Page Controls",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+
+                    Surface(
+                        onClick = onClose,
+                        shape = CircleShape,
+                        color = Color.White.copy(alpha = 0.08f),
+                        border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.18f))
+                    ) {
+                        Box(
+                            modifier = Modifier.size(32.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Close Menu",
+                                tint = Color(0xFFE2E8F0),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+
+                // 1. Primary Chrome-style Refresh Page Button
+                Surface(
+                    onClick = onRefreshPage,
+                    shape = RoundedCornerShape(16.dp),
+                    color = Color(0xFF38BDF8).copy(alpha = 0.14f),
+                    border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.42f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 11.dp, horizontal = 14.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "Refresh Page",
+                            tint = Color(0xFF38BDF8),
+                            modifier = Modifier.size(19.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Refresh Current Page",
+                            color = Color(0xFFF8FAFC),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                // 2. Swipe-to-Refresh Protection Switch Row
+                Surface(
+                    onClick = { onToggleSwipeToRefresh(!swipeToRefreshEnabled) },
+                    shape = RoundedCornerShape(16.dp),
+                    color = Color.White.copy(alpha = 0.05f),
+                    border = BorderStroke(
+                        0.9.dp,
+                        if (swipeToRefreshEnabled) Color(0xFF38BDF8).copy(alpha = 0.40f)
+                        else Color.White.copy(alpha = 0.12f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 13.dp, vertical = 9.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.SwipeVertical,
+                                contentDescription = null,
+                                tint = if (swipeToRefreshEnabled) Color(0xFF38BDF8) else Color(0xFF94A3B8),
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Column {
+                                Text(
+                                    text = "Swipe to Refresh",
+                                    color = Color(0xFFF8FAFC),
+                                    fontSize = 12.5.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = if (swipeToRefreshEnabled) "ON · Pull from top edge to reload"
+                                    else "OFF · Scroll up safely without reload",
+                                    color = if (swipeToRefreshEnabled) Color(0xFF38BDF8) else Color(0xFF34D399),
+                                    fontSize = 10.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+
+                        Switch(
+                            checked = swipeToRefreshEnabled,
+                            onCheckedChange = onToggleSwipeToRefresh,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color(0xFF090D16),
+                                checkedTrackColor = Color(0xFF38BDF8),
+                                uncheckedThumbColor = Color(0xFFE2E8F0),
+                                uncheckedTrackColor = Color(0xFF1E293B)
+                            ),
+                            modifier = Modifier.scale(0.85f)
+                        )
+                    }
+                }
+
+                // 3. Compact 3-Column Chrome Quick Actions Row (Back, Forward, Scroll Top — no PDF column)
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    WebQuickActionItem(
+                        icon = Icons.AutoMirrored.Filled.ArrowBack,
+                        label = "Back",
+                        enabled = canGoBack,
+                        accentColor = Color(0xFF38BDF8),
+                        onClick = onGoBack,
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    WebQuickActionItem(
+                        icon = Icons.AutoMirrored.Filled.ArrowForward,
+                        label = "Forward",
+                        enabled = canGoForward,
+                        accentColor = Color(0xFF38BDF8),
+                        onClick = onGoForward,
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    WebQuickActionItem(
+                        icon = Icons.Default.KeyboardArrowUp,
+                        label = "Scroll Top",
+                        enabled = true,
+                        accentColor = Color(0xFF34D399),
+                        onClick = onScrollToTop,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WebQuickActionItem(
+    icon: ImageVector,
+    label: String,
+    enabled: Boolean,
+    accentColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val alpha = if (enabled) 1f else 0.38f
+    Surface(
+        onClick = { if (enabled) onClick() },
+        enabled = enabled,
+        shape = RoundedCornerShape(14.dp),
+        color = Color.White.copy(alpha = 0.06f * alpha),
+        border = BorderStroke(0.9.dp, Color.White.copy(alpha = 0.14f * alpha)),
+        modifier = modifier
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(vertical = 10.dp, horizontal = 6.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = accentColor.copy(alpha = alpha),
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = label,
+                color = Color(0xFFF1F5F9).copy(alpha = alpha),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+

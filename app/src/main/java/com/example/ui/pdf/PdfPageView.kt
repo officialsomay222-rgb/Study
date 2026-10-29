@@ -3,8 +3,10 @@ package com.example.ui.pdf
 import android.graphics.Bitmap
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
@@ -21,6 +23,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -28,8 +31,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * Individual PDF Page renderer component with compressed graphics pipeline,
- * instantaneous cache hit rendering, and elegant fallback loading states.
+ * Google Drive-grade PDF Page renderer with High-DPI base rendering,
+ * seamless in-place Ultra-HD upgrade during microscopic zoom, and FilterQuality.High text clarity.
  */
 @Composable
 fun PdfSinglePageView(
@@ -37,69 +40,89 @@ fun PdfSinglePageView(
     engine: PdfRenderEngine,
     colorFilter: ColorFilter? = null,
     isSwipeMode: Boolean = true,
+    isHighZoom: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     var pageBitmap by remember(pageIndex, engine) { mutableStateOf<Bitmap?>(null) }
 
+    // Load High-DPI base bitmap immediately
     LaunchedEffect(pageIndex, engine) {
-        val bmp = engine.getPageBitmap(pageIndex)
-        pageBitmap = bmp
+        val bmp = engine.getPageBitmap(pageIndex, ultraHd = false)
+        if (bmp != null) {
+            pageBitmap = bmp
+        }
+    }
+
+    // Seamlessly upgrade in-place to Ultra-HD bitmap when user zooms in for microscopic text clarity
+    LaunchedEffect(pageIndex, engine, isHighZoom) {
+        if (isHighZoom) {
+            val ultraBmp = engine.getPageBitmap(pageIndex, ultraHd = true)
+            if (ultraBmp != null) {
+                pageBitmap = ultraBmp
+            }
+        }
     }
 
     Box(
         modifier = modifier,
         contentAlignment = Alignment.Center
     ) {
-        Crossfade(
-            targetState = pageBitmap,
-            animationSpec = tween(150),
-            label = "pageCrossfade"
-        ) { bmp ->
-            if (bmp != null) {
-                Box(
-                    modifier = if (isSwipeMode) {
-                        Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = 6.dp, vertical = 8.dp)
-                            .shadow(
-                                elevation = 8.dp,
-                                shape = RoundedCornerShape(10.dp),
-                                ambientColor = Color.Black.copy(alpha = 0.45f),
-                                spotColor = Color.Black.copy(alpha = 0.65f)
-                            )
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(Color.White)
-                    } else {
-                        val aspect = (bmp.width.toFloat() / bmp.height.toFloat().coerceAtLeast(1f)).coerceIn(0.2f, 5f)
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 6.dp)
-                            .aspectRatio(aspect)
-                            .shadow(
-                                elevation = 8.dp,
-                                shape = RoundedCornerShape(10.dp),
-                                ambientColor = Color.Black.copy(alpha = 0.45f),
-                                spotColor = Color.Black.copy(alpha = 0.65f)
-                            )
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(Color.White)
-                    },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Image(
-                        bitmap = bmp.asImageBitmap(),
-                        contentDescription = "Page ${pageIndex + 1}",
-                        contentScale = if (isSwipeMode) ContentScale.Fit else ContentScale.FillWidth,
-                        colorFilter = colorFilter,
-                        modifier = if (isSwipeMode) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
-                    )
-                }
-            } else {
+        val currentBmp = pageBitmap
+        if (currentBmp != null) {
+            val aspect = (currentBmp.width.toFloat() / currentBmp.height.toFloat().coerceAtLeast(1f)).coerceIn(0.15f, 6f)
+            Box(
+                modifier = if (isSwipeMode) {
+                    Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 4.dp, vertical = 6.dp)
+                        .shadow(
+                            elevation = 10.dp,
+                            shape = RoundedCornerShape(8.dp),
+                            ambientColor = Color.Black.copy(alpha = 0.5f),
+                            spotColor = Color.Black.copy(alpha = 0.7f)
+                        )
+                        .clip(RoundedCornerShape(8.dp))
+                        .border(BorderStroke(0.5.dp, Color.White.copy(alpha = 0.18f)), RoundedCornerShape(8.dp))
+                        .background(Color.White)
+                } else {
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp, vertical = 3.dp)
+                        .aspectRatio(aspect)
+                        .shadow(
+                            elevation = 8.dp,
+                            shape = RoundedCornerShape(6.dp),
+                            ambientColor = Color.Black.copy(alpha = 0.45f),
+                            spotColor = Color.Black.copy(alpha = 0.65f)
+                        )
+                        .clip(RoundedCornerShape(6.dp))
+                        .border(BorderStroke(0.5.dp, Color.Black.copy(alpha = 0.12f)), RoundedCornerShape(6.dp))
+                        .background(Color.White)
+                },
+                contentAlignment = Alignment.Center
+            ) {
+                Image(
+                    bitmap = currentBmp.asImageBitmap(),
+                    contentDescription = "Page ${pageIndex + 1}",
+                    contentScale = if (isSwipeMode) ContentScale.Fit else ContentScale.FillWidth,
+                    colorFilter = colorFilter,
+                    filterQuality = FilterQuality.High,
+                    modifier = if (isSwipeMode) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
+                )
+            }
+        } else {
+            Crossfade(
+                targetState = false,
+                animationSpec = tween(150),
+                label = "pagePlaceholder"
+            ) { _ ->
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(480.dp)
-                        .clip(RoundedCornerShape(10.dp))
+                        .height(500.dp)
+                        .padding(horizontal = 4.dp, vertical = 3.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .border(BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)), RoundedCornerShape(8.dp))
                         .background(Color(0xFF141928)),
                     contentAlignment = Alignment.Center
                 ) {
@@ -110,11 +133,11 @@ fun PdfSinglePageView(
                         CircularProgressIndicator(
                             color = Color(0xFF00E5FF),
                             strokeWidth = 3.dp,
-                            modifier = Modifier.size(36.dp)
+                            modifier = Modifier.size(34.dp)
                         )
-                        Spacer(modifier = Modifier.height(14.dp))
+                        Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "Loading Page ${pageIndex + 1}...",
+                            text = "Rendering Page ${pageIndex + 1}...",
                             color = Color(0xFF90CAF9),
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium

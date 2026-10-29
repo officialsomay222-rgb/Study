@@ -81,10 +81,12 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.roundToInt
 import com.example.util.FileImportHelper
 import com.example.ui.pdf.DocxToPdfConverter
 
@@ -166,6 +168,15 @@ fun PdfViewerScreen(
     // Floating Orb Menu State (Bottom-Right Ball)
     var isOrbMenuOpen by remember { mutableStateOf(false) }
 
+    // Pager state for horizontal swipe mode with prefetching
+    val pagerState = rememberPagerState(
+        initialPage = 0,
+        pageCount = { max(1, pageCount) }
+    )
+
+    // LazyListState for continuous vertical flow mode
+    val listState = rememberLazyListState()
+
     // Fluid continuous Zoom & pan state with spring interpolation
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var panOffsetX by remember { mutableFloatStateOf(0f) }
@@ -174,17 +185,42 @@ fun PdfViewerScreen(
     var lastTapTime by remember { mutableLongStateOf(0L) }
 
     var zoomAnimJob by remember { mutableStateOf<Job?>(null) }
+    var flingJob by remember { mutableStateOf<Job?>(null) }
 
-    fun animateZoomAndPan(targetZoom: Float, targetPanX: Float = 0f, targetPanY: Float = 0f) {
+    val densityForZoom = LocalDensity.current
+
+    fun animateZoomAndPan(
+        targetZoom: Float,
+        targetPanX: Float = 0f,
+        targetPanY: Float = 0f,
+        focusScreenY: Float? = null
+    ) {
         zoomAnimJob?.cancel()
+        flingJob?.cancel()
         zoomAnimJob = coroutineScope.launch {
             val startZoom = zoomScale
             val startPanX = panOffsetX
             val startPanY = panOffsetY
+            var prevZoom = startZoom
+            var subPixelRemainder = 0f
+            val topPadPx = with(densityForZoom) {
+                (if (barsVisible) topBarNotchSafePadding + 48.dp else safeCutout).toPx()
+            }
             animate(0f, 1f, animationSpec = tween(220, easing = FastOutSlowInEasing)) { progress, _ ->
-                zoomScale = startZoom + (targetZoom - startZoom) * progress
+                val newZoom = startZoom + (targetZoom - startZoom) * progress
+                val stepRatio = if (prevZoom > 0.01f) newZoom / prevZoom else 1f
+                zoomScale = newZoom
                 panOffsetX = startPanX + (targetPanX - startPanX) * progress
                 panOffsetY = startPanY + (targetPanY - startPanY) * progress
+
+                if (viewMode == PdfViewMode.CONTINUOUS_FLOW && focusScreenY != null && abs(stepRatio - 1f) > 0.0001f) {
+                    val focalDistInFirstItem = listState.firstVisibleItemScrollOffset.toFloat() +
+                            (focusScreenY - topPadPx).coerceAtLeast(0f)
+                    val desiredScroll = focalDistInFirstItem * (stepRatio - 1f) + subPixelRemainder
+                    val consumed = listState.dispatchRawDelta(desiredScroll)
+                    subPixelRemainder = desiredScroll - consumed
+                }
+                prevZoom = newZoom
             }
         }
     }
@@ -240,77 +276,98 @@ fun PdfViewerScreen(
         errorMessage = null
 
         withContext(Dispatchers.IO) {
-            try {
-                val targetFile: File = when {
-                    pdfSource.startsWith("http://") || pdfSource.startsWith("https://") -> {
-                        // 1. Check if the file is already downloaded in public Downloads or cache
-                        var foundFile: File? = null
-                        try {
-                            val candidateName = resolvedTitle.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
-                            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                            val f1 = File(downloadsDir, resolvedTitle)
-                            val f2 = File(downloadsDir, candidateName)
-                            val f3 = File(downloadsDir, "$candidateName.pdf")
-                            when {
-                                f1.exists() && f1.length() > 512 -> foundFile = f1
-                                f2.exists() && f2.length() > 512 -> foundFile = f2
-                                f3.exists() && f3.length() > 512 -> foundFile = f3
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-
-                        if (foundFile != null) {
-                            if (DocxToPdfConverter.isWordOrOfficeDocument(foundFile.name, null) || FileImportHelper.isDocxZip(foundFile)) {
-                                DocxToPdfConverter.convertToPdf(context, foundFile, resolvedTitle)
-                            } else {
-                                FileImportHelper.sanitizePdfFile(foundFile)
-                            }
-                        } else {
-                            // Download using CookieManager & UserAgent into app cache
-                            val prepared = FileImportHelper.importAndPrepareDocument(context, Uri.parse(pdfSource), resolvedTitle)
-                            prepared?.first ?: throw IllegalStateException("Could not load document from web.")
-                        }
-                    }
-                    pdfSource.startsWith("content://") -> {
-                        val uri = Uri.parse(pdfSource)
-                        val prepared = FileImportHelper.importAndPrepareDocument(context, uri, resolvedTitle)
-                        prepared?.first ?: throw IllegalStateException("Could not read document from external app.")
-                    }
-                    else -> {
-                        val f = if (pdfSource.startsWith("file://")) {
+            var lastError: Exception? = null
+            for (attempt in 1..2) {
+                try {
+                    val targetFile: File = when {
+                        pdfSource.startsWith("http://") || pdfSource.startsWith("https://") || pdfSource.startsWith("data:") -> {
+                            // 1. Check if a COMPLETE file is already in public Downloads
+                            var foundFile: File? = null
                             try {
-                                File(Uri.parse(pdfSource).path ?: pdfSource.removePrefix("file://"))
+                                val candidateName = resolvedTitle.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
+                                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                                val candidates = listOf(
+                                    File(downloadsDir, resolvedTitle),
+                                    File(downloadsDir, candidateName),
+                                    File(downloadsDir, "$candidateName.pdf")
+                                )
+                                for (cand in candidates) {
+                                    if (cand.exists() && cand.length() > 512 &&
+                                        (FileImportHelper.isCompletePdfFile(cand) || FileImportHelper.isDocxZip(cand))
+                                    ) {
+                                        foundFile = cand
+                                        break
+                                    }
+                                }
                             } catch (e: Exception) {
-                                File(pdfSource.removePrefix("file://"))
+                                e.printStackTrace()
                             }
-                        } else {
-                            File(pdfSource)
-                        }
 
-                        if (f.exists() && f.length() > 0) {
-                            if (DocxToPdfConverter.isWordOrOfficeDocument(f.name, null) || FileImportHelper.isDocxZip(f)) {
-                                DocxToPdfConverter.convertToPdf(context, f, resolvedTitle)
+                            if (foundFile != null) {
+                                if (DocxToPdfConverter.isWordOrOfficeDocument(foundFile.name, null) || FileImportHelper.isDocxZip(foundFile)) {
+                                    DocxToPdfConverter.convertToPdf(context, foundFile, resolvedTitle)
+                                } else {
+                                    FileImportHelper.sanitizePdfFile(foundFile, context, resolvedTitle)
+                                }
                             } else {
-                                FileImportHelper.sanitizePdfFile(f)
+                                // Download using CookieManager & UserAgent into app cache
+                                val prepared = FileImportHelper.importAndPrepareDocument(context, Uri.parse(pdfSource), resolvedTitle)
+                                prepared?.first ?: throw IllegalStateException("Could not load document from web.")
                             }
-                        } else {
+                        }
+                        pdfSource.startsWith("content://") -> {
                             val uri = Uri.parse(pdfSource)
                             val prepared = FileImportHelper.importAndPrepareDocument(context, uri, resolvedTitle)
-                            prepared?.first ?: throw IllegalStateException("PDF file not found on device.")
+                            prepared?.first ?: throw IllegalStateException("Could not read document from external app.")
+                        }
+                        else -> {
+                            val f = if (pdfSource.startsWith("file://")) {
+                                try {
+                                    File(Uri.parse(pdfSource).path ?: pdfSource.removePrefix("file://"))
+                                } catch (e: Exception) {
+                                    File(pdfSource.removePrefix("file://"))
+                                }
+                            } else {
+                                File(pdfSource)
+                            }
+
+                            if (f.exists() && f.length() > 0) {
+                                if (DocxToPdfConverter.isWordOrOfficeDocument(f.name, null) || FileImportHelper.isDocxZip(f)) {
+                                    DocxToPdfConverter.convertToPdf(context, f, resolvedTitle)
+                                } else {
+                                    FileImportHelper.sanitizePdfFile(f, context, resolvedTitle)
+                                }
+                            } else {
+                                val uri = Uri.parse(pdfSource)
+                                val prepared = FileImportHelper.importAndPrepareDocument(context, uri, resolvedTitle)
+                                prepared?.first ?: throw IllegalStateException("PDF file not found on device.")
+                            }
                         }
                     }
-                }
 
-                val engine = PdfRenderEngine(targetFile, screenDensity)
-                renderEngine = engine
-                pageCount = engine.pageCount
-                currentPageIndex = 0
-                localPdfFile = targetFile
-                isDownloading = false
-            } catch (e: Exception) {
-                e.printStackTrace()
-                errorMessage = "Document Error: ${e.localizedMessage ?: "Invalid or encrypted document format"}"
+                    val engine = PdfRenderEngine(targetFile, screenDensity)
+                    if (engine.pageCount <= 0) {
+                        engine.close()
+                        throw IllegalStateException("Document contains no readable pages.")
+                    }
+                    renderEngine = engine
+                    pageCount = engine.pageCount
+                    currentPageIndex = 0
+                    localPdfFile = targetFile
+                    errorMessage = null
+                    isDownloading = false
+                    lastError = null
+                    break
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    lastError = e
+                    if (attempt == 1) {
+                        delay(650)
+                    }
+                }
+            }
+            if (lastError != null && renderEngine == null) {
+                errorMessage = "Document Error: ${lastError.localizedMessage ?: "Invalid or encrypted document format"}"
                 isDownloading = false
             }
         }
@@ -325,15 +382,6 @@ fun PdfViewerScreen(
             }
         }
     }
-
-    // Pager state for horizontal swipe mode with prefetching
-    val pagerState = rememberPagerState(
-        initialPage = 0,
-        pageCount = { max(1, pageCount) }
-    )
-
-    // LazyListState for continuous vertical flow mode
-    val listState = rememberLazyListState()
 
     // Sync current page between modes and states, resetting zoom on page flip
     LaunchedEffect(pagerState.currentPage) {
@@ -444,6 +492,7 @@ fun PdfViewerScreen(
         // MAIN CONTENT AREA: SWIPEABLE PAGES WITH COMPRESSED GRAPHICS
         if (pageCount > 0 && renderEngine != null) {
             val engine = renderEngine!!
+            val densityForZoom = LocalDensity.current
 
             Box(
                 modifier = Modifier
@@ -452,8 +501,10 @@ fun PdfViewerScreen(
                     .pointerInput(viewMode) {
                         awaitEachGesture {
                             zoomAnimJob?.cancel()
+                            flingJob?.cancel()
                             val firstDown = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                             zoomAnimJob?.cancel()
+                            flingJob?.cancel()
                             val downTime = System.currentTimeMillis()
                             val downPos = firstDown.position
                             var isMultiTouch = false
@@ -466,6 +517,7 @@ fun PdfViewerScreen(
                             val ch = if (containerSize.height > 0) containerSize.height.toFloat() else 1920f
                             val centerX = cw / 2f
                             val centerY = ch / 2f
+                            var subPixelScrollRemainder = 0f
 
                             do {
                                 val event = awaitPointerEvent(PointerEventPass.Initial)
@@ -474,7 +526,8 @@ fun PdfViewerScreen(
 
                                 if (count >= 2) {
                                     zoomAnimJob?.cancel()
-                                    // TWO-FINGER GESTURE: Dynamic centroid focal-point pinch-to-zoom & pan
+                                    flingJob?.cancel()
+                                    // TWO-FINGER GESTURE: Exact centroid focal-point pinch-to-zoom & pan
                                     isMultiTouch = true
                                     hasMoved = true
 
@@ -482,13 +535,12 @@ fun PdfViewerScreen(
                                     val rawZoom = event.calculateZoom()
                                     val panDelta = event.calculatePan()
 
-                                    // Dynamic zooming: sensitive, continuous scaling with focal anchoring
                                     if (rawZoom > 0f && rawZoom != 1f) {
                                         val oldZoom = zoomScale
                                         val targetZoom = (oldZoom * rawZoom).coerceIn(0.75f, 5.0f)
                                         val scaleRatio = targetZoom / oldZoom
 
-                                        // Centroid focal shift: keeps content under fingers locked to hand gesture
+                                        // Horizontal centroid focal shift: keeps pinched X spot locked under fingers
                                         val focusX = centroid.x - centerX
                                         val focalShiftX = (focusX - panOffsetX) * (1f - scaleRatio)
 
@@ -498,8 +550,20 @@ fun PdfViewerScreen(
 
                                         if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
                                             panOffsetY = 0f
-                                            if (panDelta.y != 0f) {
-                                                listState.dispatchRawDelta(-panDelta.y)
+                                            // Exact vertical focal compensation so zooming into a specific area never drifts upward
+                                            val topPadPx = with(densityForZoom) {
+                                                (if (barsVisible) topBarNotchSafePadding + 48.dp else safeCutout).toPx()
+                                            }
+                                            val focalDistInFirstItem =
+                                                listState.firstVisibleItemScrollOffset.toFloat() +
+                                                        (centroid.y - topPadPx).coerceAtLeast(0f)
+                                            val zoomScrollComp = focalDistInFirstItem * (scaleRatio - 1f)
+                                            val desiredScroll = zoomScrollComp - panDelta.y + subPixelScrollRemainder
+                                            if (abs(desiredScroll) >= 0.5f) {
+                                                val consumed = listState.dispatchRawDelta(desiredScroll)
+                                                subPixelScrollRemainder = desiredScroll - consumed
+                                            } else {
+                                                subPixelScrollRemainder = desiredScroll
                                             }
                                         } else {
                                             val focusY = centroid.y - centerY
@@ -522,53 +586,65 @@ fun PdfViewerScreen(
                                         }
                                     }
 
-                                    // Intercept and consume so underlying pager does not scroll during pinch
+                                    // Intercept and consume so underlying pager/list does not jitter during pinch
                                     event.changes.forEach { it.consume() }
                                 } else if (count == 1) {
                                     val change = activePointers.first()
-                                    velocityTracker.addPosition(change.uptimeMillis, change.position)
-                                    val dist = (change.position - downPos).getDistance()
-                                    if (dist > touchSlop) {
-                                        hasMoved = true
-                                    }
+                                    if (!isMultiTouch) {
+                                        velocityTracker.addPosition(change.uptimeMillis, change.position)
+                                        val dist = (change.position - downPos).getDistance()
+                                        if (dist > touchSlop) {
+                                            hasMoved = true
+                                        }
 
-                                    if (zoomScale > 1.05f) {
-                                        // ONE FINGER DRAG WHILE ZOOMED IN: Smoothly scroll and pan
-                                        if (dist > touchSlop || hasMoved) {
-                                            val panDelta = event.calculatePan()
-                                            if (panDelta != Offset.Zero) {
-                                                val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
-                                                panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
+                                        if (zoomScale > 1.05f) {
+                                            // ONE FINGER DRAG WHILE ZOOMED IN: Smoothly scroll and pan without multi-touch jump
+                                            if (dist > touchSlop || hasMoved) {
+                                                val panDelta = event.calculatePan()
+                                                if (panDelta != Offset.Zero) {
+                                                    val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
+                                                    panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
 
-                                                if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
-                                                    // In Flow mode: Seamless list scrolling in exact swipe direction (no vertical gaps)
-                                                    panOffsetY = 0f
-                                                    if (panDelta.y != 0f) {
-                                                        listState.dispatchRawDelta(-panDelta.y)
+                                                    if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
+                                                        // In Flow mode: Seamless list scrolling in exact swipe direction
+                                                        panOffsetY = 0f
+                                                        if (panDelta.y != 0f) {
+                                                            listState.dispatchRawDelta(-panDelta.y)
+                                                            if (panDelta.y < -10f && barsVisible && !isOrbMenuOpen) {
+                                                                barsVisible = false
+                                                            } else if (panDelta.y > 10f && !barsVisible) {
+                                                                barsVisible = true
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // In Page Swipe mode: Pan inside the current page
+                                                        val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
+                                                        panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
                                                     }
-                                                } else {
-                                                    // In Page Swipe mode: Pan inside the current page
-                                                    val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
-                                                    panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
                                                 }
+                                                change.consume()
                                             }
+                                        }
+                                    } else {
+                                        // Finger lifted after 2-finger pinch: consume remaining single-finger frames so page doesn't jump
+                                        if (zoomScale > 1.05f) {
                                             change.consume()
                                         }
                                     }
-                                    // When zoomScale <= 1.05f, we DO NOT consume!
+                                    // When zoomScale <= 1.05f and !isMultiTouch, we DO NOT consume!
                                     // Native gestures scroll list or flip pages freely
                                 }
                             } while (event.changes.any { it.pressed })
 
-                            // Fling inertia on release in zoomed Flow mode
+                            // Fling inertia on release in zoomed Flow mode (cancellable on next touch down)
                             if (viewMode == PdfViewMode.CONTINUOUS_FLOW && zoomScale > 1.05f && hasMoved && !isMultiTouch) {
                                 val velocity = velocityTracker.calculateVelocity()
-                                if (abs(velocity.y) > 120f) {
-                                    coroutineScope.launch {
+                                if (abs(velocity.y) > 110f) {
+                                    flingJob = coroutineScope.launch {
                                         try {
                                             listState.animateScrollBy(
-                                                -velocity.y * 0.18f,
-                                                tween(260, easing = FastOutSlowInEasing)
+                                                -velocity.y * 0.22f,
+                                                tween(290, easing = FastOutSlowInEasing)
                                             )
                                         } catch (_: Exception) {
                                         }
@@ -607,7 +683,7 @@ fun PdfViewerScreen(
                                 val upTime = System.currentTimeMillis()
                                 if (upTime - downTime < 320L) {
                                     if (upTime - lastTapTime < 320L) {
-                                        // DOUBLE TAP: If zoomed in OR zoomed out, fix to 1x zoom. If at 1x, zoom to 2.25x
+                                        // DOUBLE TAP: If zoomed in OR zoomed out, fix to 1x zoom. If at 1x, zoom into tapped spot (2.25x)
                                         lastTapTime = 0L
                                         if (abs(zoomScale - 1f) > 0.06f) {
                                             // Fix to 1x zoom for both zoomed in and zoomed out modes!
@@ -621,7 +697,12 @@ fun PdfViewerScreen(
                                                 val maxPanY2 = (ch * 1.25f) / 2f
                                                 (-focusY * 1.25f).coerceIn(-maxPanY2, maxPanY2)
                                             }
-                                            animateZoomAndPan(2.25f, targetPanX, targetPanY)
+                                            animateZoomAndPan(
+                                                targetZoom = 2.25f,
+                                                targetPanX = targetPanX,
+                                                targetPanY = targetPanY,
+                                                focusScreenY = downPos.y
+                                            )
                                         }
                                     } else {
                                         lastTapTime = upTime
@@ -664,6 +745,7 @@ fun PdfViewerScreen(
                             engine = engine,
                             colorFilter = paperColorFilter,
                             isSwipeMode = true,
+                            isHighZoom = zoomScale >= 1.55f,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(
@@ -709,6 +791,7 @@ fun PdfViewerScreen(
                                     engine = engine,
                                     colorFilter = paperColorFilter,
                                     isSwipeMode = false,
+                                    isHighZoom = zoomScale >= 1.55f,
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .padding(horizontal = 10.dp)
@@ -1157,6 +1240,9 @@ fun PdfViewerScreen(
                         PaperTheme.DARK_MODE -> PaperTheme.CLEAN_WHITE
                     }
                 },
+                onSelectTheme = { selectedTheme ->
+                    paperTheme = selectedTheme
+                },
                 onResetZoom = {
                     animateZoomAndPan(1f, 0f, 0f)
                 },
@@ -1166,11 +1252,87 @@ fun PdfViewerScreen(
             )
         }
 
-        // MINIMALIST FLOATING LIQUID GLASS BALL (ORB) IN BOTTOM RIGHT CORNER
+        // INTERACTIVE ZOOM LEVEL PILL IN BOTTOM LEFT (tap to reset to 1x)
+        AnimatedVisibility(
+            visible = pageCount > 0 && !isOrbMenuOpen && abs(zoomScale - 1f) > 0.04f,
+            enter = fadeIn(animationSpec = tween(180)) + scaleIn(animationSpec = tween(180), transformOrigin = TransformOrigin(0f, 1f)),
+            exit = fadeOut(animationSpec = tween(180)) + scaleOut(animationSpec = tween(180), transformOrigin = TransformOrigin(0f, 1f)),
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(start = 18.dp, bottom = 20.dp)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(22.dp),
+                color = Color.Transparent,
+                modifier = Modifier
+                    .shadow(10.dp, RoundedCornerShape(22.dp), spotColor = Color(0x6600E5FF))
+                    .clickable { animateZoomAndPan(1f, 0f, 0f) }
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(
+                                    Color.White.copy(alpha = 0.24f),
+                                    Color(0xFF131A2E).copy(alpha = 0.88f),
+                                    Color(0xFF090D18).copy(alpha = 0.96f)
+                                )
+                            )
+                        )
+                        .border(
+                            BorderStroke(1.dp, Brush.linearGradient(listOf(Color.White.copy(0.6f), Color(0xFF00E5FF).copy(0.45f)))),
+                            RoundedCornerShape(22.dp)
+                        )
+                        .padding(horizontal = 14.dp, vertical = 9.dp)
+                ) {
+                    Text(
+                        text = "${(zoomScale * 100).roundToInt()}%",
+                        color = Color(0xFF00E5FF),
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    if (zoomScale >= 1.55f) {
+                        Text(
+                            text = "HD",
+                            color = Color(0xFF00E676),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Black
+                        )
+                    }
+                    Text(
+                        text = "· 1x",
+                        color = Color.White.copy(alpha = 0.85f),
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
+
+        // MINIMALIST FLOATING CONTROL BALL (ORB) IN BOTTOM RIGHT CORNER
+        // Hides underneath the screen when scrolling down and comes back up when scrolling up
         AnimatedVisibility(
             visible = (barsVisible || isOrbMenuOpen) && pageCount > 0,
-            enter = fadeIn(animationSpec = tween(220)) + scaleIn(animationSpec = tween(220), transformOrigin = TransformOrigin(1f, 1f)),
-            exit = fadeOut(animationSpec = tween(220)) + scaleOut(animationSpec = tween(220), transformOrigin = TransformOrigin(1f, 1f)),
+            enter = slideInVertically(
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessMediumLow
+                ),
+                initialOffsetY = { it * 2 }
+            ) + fadeIn(animationSpec = tween(200)) + scaleIn(
+                animationSpec = tween(200),
+                transformOrigin = TransformOrigin(1f, 1f)
+            ),
+            exit = slideOutVertically(
+                animationSpec = tween(220, easing = FastOutSlowInEasing),
+                targetOffsetY = { it * 2 }
+            ) + fadeOut(animationSpec = tween(180)) + scaleOut(
+                animationSpec = tween(180),
+                transformOrigin = TransformOrigin(1f, 1f)
+            ),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .windowInsetsPadding(WindowInsets.navigationBars)
@@ -1180,7 +1342,7 @@ fun PdfViewerScreen(
                 onClick = { isOrbMenuOpen = !isOrbMenuOpen },
                 isOpen = isOrbMenuOpen,
                 pageText = "${currentPageIndex + 1} / $pageCount",
-                accentColor = Color(0xFF00E5FF)
+                accentColor = Color(0xFF38BDF8)
             )
         }
 

@@ -22,7 +22,7 @@ import kotlin.math.roundToInt
  */
 enum class PdfViewMode {
     PAGE_SWIPE,      // Horizontal swipe pager (eBook style)
-    CONTINUOUS_FLOW  // Vertical continuous stream (Document scroll)
+    CONTINUOUS_FLOW  // Vertical continuous stream (Google Drive style)
 }
 
 /**
@@ -35,15 +35,13 @@ enum class PaperTheme {
 }
 
 /**
- * High-performance, memory-optimized PDF rendering engine.
+ * Google Drive-grade Ultra-Crisp PDF Rendering Engine.
  *
- * Optimizations for silky-smooth, lag-free viewing:
- * 1. Compressed RGB_565 Bitmaps: Cuts RAM usage & GPU texture upload bandwidth by 50%.
- * 2. Adaptive Resolution: Caps max width at optimal reading resolution (~800-960px) rather
- *    than wasteful 4K/2K buffers, yielding 3x faster rasterization.
- * 3. Proactive Prefetching: Asynchronously renders adjacent pages (i-1, i+1, i+2) in the
- *    background so swiping is instantaneous with zero stutter.
- * 4. Thread-Safe Mutex & Safe Eviction: Prevents concurrency issues and eliminates OOM risks.
+ * Delivers razor-sharp vector text rasterization:
+ * 1. Super-Sampled High-DPI Base Rendering (1800px–2160px width) with true aspect-ratio preservation.
+ * 2. Dynamic Microscopic Zoom Re-Rasterization (up to 2880px width when zoomed in) for crystal-clear typography.
+ * 3. Proactive Background Prefetching of adjacent pages for zero-latency scrolling.
+ * 4. Thread-Safe Mutex & Automatic OOM Fallback.
  */
 class PdfRenderEngine(
     val file: File,
@@ -56,16 +54,10 @@ class PdfRenderEngine(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val renderMutex = Mutex()
 
-    // Dynamic memory cache: comfortably stores 12-24 compressed pages
-    private val maxCacheKb = ((Runtime.getRuntime().maxMemory() / 1024) / 8).toInt().coerceIn(16 * 1024, 64 * 1024)
+    // Generous memory cache for high-DPI pages (keys: pageIndex for base HD, pageIndex + 100_000 for Ultra-HD zoom)
+    private val maxCacheKb = ((Runtime.getRuntime().maxMemory() / 1024) / 5).toInt().coerceIn(32 * 1024, 128 * 1024)
     private val cache = object : LruCache<Int, Bitmap>(maxCacheKb) {
         override fun sizeOf(key: Int, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
-        override fun entryRemoved(evicted: Boolean, key: Int?, oldValue: Bitmap?, newValue: Bitmap?) {
-            super.entryRemoved(evicted, key, oldValue, newValue)
-            if (evicted && oldValue != null && !oldValue.isRecycled) {
-                // Let GC reclaim memory gracefully
-            }
-        }
     }
 
     init {
@@ -77,28 +69,43 @@ class PdfRenderEngine(
     }
 
     /**
-     * Retrieves or rasterizes the page bitmap cleanly without thread contention.
+     * Retrieves or rasterizes the page bitmap at Google Drive High-DPI quality,
+     * or Ultra-HD quality when [ultraHd] is requested during deep zoom.
      */
-    suspend fun getPageBitmap(pageIndex: Int): Bitmap? = withContext(Dispatchers.IO) {
+    suspend fun getPageBitmap(pageIndex: Int, ultraHd: Boolean = false): Bitmap? = withContext(Dispatchers.IO) {
         if (pageIndex < 0 || pageIndex >= pageCount) return@withContext null
 
+        val cacheKey = if (ultraHd) pageIndex + 100_000 else pageIndex
+
         // Fast-path cache lookup
-        cache.get(pageIndex)?.let { return@withContext it }
+        cache.get(cacheKey)?.let { return@withContext it }
 
         renderMutex.withLock {
-            // Re-check after acquiring lock
-            cache.get(pageIndex)?.let { return@withContext it }
+            cache.get(cacheKey)?.let { return@withContext it }
             val rend = renderer ?: return@withContext null
 
             try {
                 val page = rend.openPage(pageIndex)
 
-                val baseWidth = page.width
-                val baseHeight = page.height
-                val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat().coerceAtLeast(1f)
+                val baseWidth = page.width.coerceAtLeast(1)
+                val baseHeight = page.height.coerceAtLeast(1)
+                val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
 
-                val targetWidth = (baseWidth * screenDensity * 0.85f).roundToInt().coerceIn(480, 1080)
-                val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(600, 1920)
+                val desiredWidth = if (ultraHd) {
+                    maxOf((baseWidth * screenDensity * 2.1f).roundToInt(), 2560).coerceIn(2048, 2880)
+                } else {
+                    maxOf((baseWidth * screenDensity * 1.45f).roundToInt(), 1800).coerceIn(1440, 2160)
+                }
+
+                // Preserve exact page aspect ratio while keeping max texture size safe for GPU (< 4096px)
+                val rawHeight = (desiredWidth * aspectRatio).roundToInt().coerceAtLeast(1)
+                val (targetWidth, targetHeight) = if (rawHeight > 3840) {
+                    val clampedH = 3840
+                    val clampedW = (clampedH / aspectRatio).roundToInt().coerceAtLeast(1)
+                    Pair(clampedW, clampedH)
+                } else {
+                    Pair(desiredWidth, rawHeight)
+                }
 
                 val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(bmp)
@@ -106,20 +113,47 @@ class PdfRenderEngine(
                 page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                 page.close()
 
-                cache.put(pageIndex, bmp)
+                cache.put(cacheKey, bmp)
 
-                // Trigger background prefetch asynchronously without blocking current page
-                triggerPrefetch(pageIndex)
+                if (!ultraHd) {
+                    triggerPrefetch(pageIndex)
+                }
 
                 bmp
             } catch (oom: OutOfMemoryError) {
                 cache.evictAll()
                 System.gc()
-                null
+                // Fallback to standard HD if Ultra-HD hit memory ceiling
+                if (ultraHd) {
+                    cache.get(pageIndex)
+                } else {
+                    renderFallbackPage(pageIndex)
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
                 null
             }
+        }
+    }
+
+    private fun renderFallbackPage(pageIndex: Int): Bitmap? {
+        val rend = renderer ?: return null
+        return try {
+            val page = rend.openPage(pageIndex)
+            val baseWidth = page.width.coerceAtLeast(1)
+            val baseHeight = page.height.coerceAtLeast(1)
+            val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
+            val targetWidth = 1200
+            val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(100, 2400)
+            val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            canvas.drawColor(Color.WHITE)
+            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            page.close()
+            cache.put(pageIndex, bmp)
+            bmp
+        } catch (_: Throwable) {
+            null
         }
     }
 
@@ -128,20 +162,26 @@ class PdfRenderEngine(
      */
     private fun triggerPrefetch(currentIndex: Int) {
         scope.launch {
-            val prefetchIndices = listOf(currentIndex + 1, currentIndex - 1)
+            val prefetchIndices = listOf(currentIndex + 1, currentIndex - 1, currentIndex + 2)
             for (idx in prefetchIndices) {
                 if (idx in 0 until pageCount && cache.get(idx) == null) {
-                    // Try to lock; if main thread is rendering a page, skip prefetching to avoid delay
                     if (renderMutex.tryLock()) {
                         try {
                             if (cache.get(idx) == null && renderer != null) {
                                 val rend = renderer ?: break
                                 val page = rend.openPage(idx)
-                                val baseWidth = page.width
-                                val baseHeight = page.height
-                                val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat().coerceAtLeast(1f)
-                                val targetWidth = (baseWidth * screenDensity * 0.85f).roundToInt().coerceIn(480, 1080)
-                                val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(600, 1920)
+                                val baseWidth = page.width.coerceAtLeast(1)
+                                val baseHeight = page.height.coerceAtLeast(1)
+                                val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
+                                val desiredWidth = maxOf((baseWidth * screenDensity * 1.45f).roundToInt(), 1800).coerceIn(1440, 2160)
+                                val rawHeight = (desiredWidth * aspectRatio).roundToInt().coerceAtLeast(1)
+                                val (targetWidth, targetHeight) = if (rawHeight > 3840) {
+                                    val clampedH = 3840
+                                    val clampedW = (clampedH / aspectRatio).roundToInt().coerceAtLeast(1)
+                                    Pair(clampedW, clampedH)
+                                } else {
+                                    Pair(desiredWidth, rawHeight)
+                                }
 
                                 val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
                                 val canvas = Canvas(bmp)

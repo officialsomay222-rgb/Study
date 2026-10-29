@@ -69,6 +69,17 @@ class PdfRenderEngine(
     }
 
     /**
+     * Synchronous fast-path lookup from memory cache to prevent 1-frame placeholder flashes while scrolling.
+     */
+    fun getCachedBitmap(pageIndex: Int, ultraHd: Boolean = false): Bitmap? {
+        if (pageIndex < 0 || pageIndex >= pageCount) return null
+        if (ultraHd) {
+            cache.get(pageIndex + 100_000)?.let { return it }
+        }
+        return cache.get(pageIndex)
+    }
+
+    /**
      * Retrieves or rasterizes the page bitmap at Google Drive High-DPI quality,
      * or Ultra-HD quality when [ultraHd] is requested during deep zoom.
      */
@@ -92,15 +103,16 @@ class PdfRenderEngine(
                 val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
 
                 val desiredWidth = if (ultraHd) {
-                    maxOf((baseWidth * screenDensity * 2.1f).roundToInt(), 2560).coerceIn(2048, 2880)
+                    maxOf((baseWidth * screenDensity * 1.75f).roundToInt(), 1920).coerceIn(1680, 2240)
                 } else {
-                    maxOf((baseWidth * screenDensity * 1.45f).roundToInt(), 1800).coerceIn(1440, 2160)
+                    maxOf((baseWidth * screenDensity * 1.2f).roundToInt(), 1360).coerceIn(1160, 1560)
                 }
 
-                // Preserve exact page aspect ratio while keeping max texture size safe for GPU (< 4096px)
+                // Preserve exact page aspect ratio while keeping max texture size fast for GPU
+                val maxAllowedHeight = if (ultraHd) 3200 else 2400
                 val rawHeight = (desiredWidth * aspectRatio).roundToInt().coerceAtLeast(1)
-                val (targetWidth, targetHeight) = if (rawHeight > 3840) {
-                    val clampedH = 3840
+                val (targetWidth, targetHeight) = if (rawHeight > maxAllowedHeight) {
+                    val clampedH = maxAllowedHeight
                     val clampedW = (clampedH / aspectRatio).roundToInt().coerceAtLeast(1)
                     Pair(clampedW, clampedH)
                 } else {
@@ -143,8 +155,8 @@ class PdfRenderEngine(
             val baseWidth = page.width.coerceAtLeast(1)
             val baseHeight = page.height.coerceAtLeast(1)
             val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
-            val targetWidth = 1200
-            val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(100, 2400)
+            val targetWidth = 1080
+            val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(100, 2000)
             val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bmp)
             canvas.drawColor(Color.WHITE)
@@ -173,10 +185,10 @@ class PdfRenderEngine(
                                 val baseWidth = page.width.coerceAtLeast(1)
                                 val baseHeight = page.height.coerceAtLeast(1)
                                 val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
-                                val desiredWidth = maxOf((baseWidth * screenDensity * 1.45f).roundToInt(), 1800).coerceIn(1440, 2160)
+                                val desiredWidth = maxOf((baseWidth * screenDensity * 1.2f).roundToInt(), 1360).coerceIn(1160, 1560)
                                 val rawHeight = (desiredWidth * aspectRatio).roundToInt().coerceAtLeast(1)
-                                val (targetWidth, targetHeight) = if (rawHeight > 3840) {
-                                    val clampedH = 3840
+                                val (targetWidth, targetHeight) = if (rawHeight > 2400) {
+                                    val clampedH = 2400
                                     val clampedW = (clampedH / aspectRatio).roundToInt().coerceAtLeast(1)
                                     Pair(clampedW, clampedH)
                                 } else {

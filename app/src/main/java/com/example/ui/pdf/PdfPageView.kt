@@ -43,22 +43,32 @@ fun PdfSinglePageView(
     isHighZoom: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    var pageBitmap by remember(pageIndex, engine) { mutableStateOf<Bitmap?>(null) }
+    var pageBitmap by remember(pageIndex, engine) {
+        mutableStateOf(engine.getCachedBitmap(pageIndex, ultraHd = isHighZoom))
+    }
 
-    // Load High-DPI base bitmap immediately
+    // Load High-DPI base bitmap immediately if not already cached
     LaunchedEffect(pageIndex, engine) {
-        val bmp = engine.getPageBitmap(pageIndex, ultraHd = false)
-        if (bmp != null) {
-            pageBitmap = bmp
+        if (pageBitmap == null) {
+            val bmp = engine.getPageBitmap(pageIndex, ultraHd = false)
+            if (bmp != null) {
+                pageBitmap = bmp
+            }
         }
     }
 
-    // Seamlessly upgrade in-place to Ultra-HD bitmap when user zooms in for microscopic text clarity
+    // Seamlessly upgrade in-place to Ultra-HD bitmap after zoom gesture settles
     LaunchedEffect(pageIndex, engine, isHighZoom) {
         if (isHighZoom) {
-            val ultraBmp = engine.getPageBitmap(pageIndex, ultraHd = true)
-            if (ultraBmp != null) {
-                pageBitmap = ultraBmp
+            val cachedUltra = engine.getCachedBitmap(pageIndex, ultraHd = true)
+            if (cachedUltra != null) {
+                pageBitmap = cachedUltra
+            } else {
+                kotlinx.coroutines.delay(260)
+                val ultraBmp = engine.getPageBitmap(pageIndex, ultraHd = true)
+                if (ultraBmp != null) {
+                    pageBitmap = ultraBmp
+                }
             }
         }
     }
@@ -69,6 +79,7 @@ fun PdfSinglePageView(
     ) {
         val currentBmp = pageBitmap
         if (currentBmp != null) {
+            val imageBitmap = remember(currentBmp) { currentBmp.asImageBitmap() }
             val aspect = (currentBmp.width.toFloat() / currentBmp.height.toFloat().coerceAtLeast(1f)).coerceIn(0.15f, 6f)
             Box(
                 modifier = if (isSwipeMode) {
@@ -76,10 +87,10 @@ fun PdfSinglePageView(
                         .fillMaxSize()
                         .padding(horizontal = 4.dp, vertical = 6.dp)
                         .shadow(
-                            elevation = 10.dp,
+                            elevation = 5.dp,
                             shape = RoundedCornerShape(8.dp),
-                            ambientColor = Color.Black.copy(alpha = 0.5f),
-                            spotColor = Color.Black.copy(alpha = 0.7f)
+                            ambientColor = Color.Black.copy(alpha = 0.4f),
+                            spotColor = Color.Black.copy(alpha = 0.55f)
                         )
                         .clip(RoundedCornerShape(8.dp))
                         .border(BorderStroke(0.5.dp, Color.White.copy(alpha = 0.18f)), RoundedCornerShape(8.dp))
@@ -90,10 +101,10 @@ fun PdfSinglePageView(
                         .padding(horizontal = 4.dp, vertical = 3.dp)
                         .aspectRatio(aspect)
                         .shadow(
-                            elevation = 8.dp,
+                            elevation = 4.dp,
                             shape = RoundedCornerShape(6.dp),
-                            ambientColor = Color.Black.copy(alpha = 0.45f),
-                            spotColor = Color.Black.copy(alpha = 0.65f)
+                            ambientColor = Color.Black.copy(alpha = 0.35f),
+                            spotColor = Color.Black.copy(alpha = 0.5f)
                         )
                         .clip(RoundedCornerShape(6.dp))
                         .border(BorderStroke(0.5.dp, Color.Black.copy(alpha = 0.12f)), RoundedCornerShape(6.dp))
@@ -102,47 +113,41 @@ fun PdfSinglePageView(
                 contentAlignment = Alignment.Center
             ) {
                 Image(
-                    bitmap = currentBmp.asImageBitmap(),
+                    bitmap = imageBitmap,
                     contentDescription = "Page ${pageIndex + 1}",
                     contentScale = if (isSwipeMode) ContentScale.Fit else ContentScale.FillWidth,
                     colorFilter = colorFilter,
-                    filterQuality = FilterQuality.High,
+                    filterQuality = FilterQuality.Medium,
                     modifier = if (isSwipeMode) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
                 )
             }
         } else {
-            Crossfade(
-                targetState = false,
-                animationSpec = tween(150),
-                label = "pagePlaceholder"
-            ) { _ ->
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(500.dp)
-                        .padding(horizontal = 4.dp, vertical = 3.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .border(BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)), RoundedCornerShape(8.dp))
-                        .background(Color(0xFF141928)),
-                    contentAlignment = Alignment.Center
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(500.dp)
+                    .padding(horizontal = 4.dp, vertical = 3.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .border(BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)), RoundedCornerShape(8.dp))
+                    .background(Color(0xFF141928)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(24.dp)
                 ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.padding(24.dp)
-                    ) {
-                        CircularProgressIndicator(
-                            color = Color(0xFF00E5FF),
-                            strokeWidth = 3.dp,
-                            modifier = Modifier.size(34.dp)
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = "Rendering Page ${pageIndex + 1}...",
-                            color = Color(0xFF90CAF9),
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                    }
+                    CircularProgressIndicator(
+                        color = Color(0xFF00E5FF),
+                        strokeWidth = 3.dp,
+                        modifier = Modifier.size(34.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "Rendering Page ${pageIndex + 1}...",
+                        color = Color(0xFF90CAF9),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
                 }
             }
         }

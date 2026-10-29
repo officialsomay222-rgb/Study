@@ -139,4 +139,23 @@ class PdfLoadingRobolectricTest {
         readyFile.inputStream().use { it.read(header) }
         assertEquals("%PDF-", String(header, Charsets.US_ASCII))
     }
+
+    @Test
+    fun `test WebScrollGuardState tracks touch and upward scroll stop state accurately`() {
+        val guard = WebScrollGuardState()
+        assertTrue(guard.isFirstSite)
+        assertFalse(guard.isTouchActive)
+        assertFalse(guard.lastScrollWasUp)
+
+        // Switch to external site
+        guard.isFirstSite = false
+        guard.isTouchActive = true
+        guard.lastScrollWasUp = true
+        guard.lastScrollEventTime = 123456L
+
+        assertFalse(guard.isFirstSite)
+        assertTrue(guard.isTouchActive)
+        assertTrue(guard.lastScrollWasUp)
+        assertEquals(123456L, guard.lastScrollEventTime)
+    }
 }

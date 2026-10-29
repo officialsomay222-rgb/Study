@@ -120,12 +120,16 @@ fun PdfViewerScreen(
     val notchGap = with(LocalDensity.current) { 3.toDp() }
     val topBarNotchSafePadding = safeCutout + notchGap
 
-    // Fullscreen Immersive Mode: Hide phone buttons & status bar in PDF opener state
+    // Fullscreen Immersive Mode: Strictly hide phone navigation bar & status bar while PDF opener is open
     // Automatically restores phone buttons & status bar on exit
     DisposableEffect(activity) {
         val window = activity?.window
         val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
 
+        if (window != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+            window.isStatusBarContrastEnforced = false
+        }
         insetsController?.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         insetsController?.hide(WindowInsetsCompat.Type.systemBars())
@@ -137,6 +141,19 @@ fun PdfViewerScreen(
 
     var isVisible by remember { mutableStateOf(false) }
     var isClosing by remember { mutableStateOf(false) }
+
+    // Keep system bars hidden across any recomposition while PDF viewer is active
+    SideEffect {
+        if (!isClosing) {
+            val window = activity?.window
+            if (window != null) {
+                val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+                insetsController.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                insetsController.hide(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         isVisible = true
@@ -160,8 +177,10 @@ fun PdfViewerScreen(
     var pageCount by remember { mutableStateOf(0) }
     var currentPageIndex by remember { mutableStateOf(0) }
 
-    // UI state: auto-hide bars on scroll down
+    // UI state: auto-hide ball & bars immediately on any scroll; show only when upward scroll stops
     var barsVisible by remember { mutableStateOf(true) }
+    var lastPdfScrollWasUp by remember { mutableStateOf(false) }
+    var isZoomGestureScrolling by remember { mutableStateOf(false) }
     var viewMode by remember { mutableStateOf(PdfViewMode.CONTINUOUS_FLOW) }
     var paperTheme by remember { mutableStateOf(PaperTheme.CLEAN_WHITE) }
 
@@ -176,6 +195,27 @@ fun PdfViewerScreen(
 
     // LazyListState for continuous vertical flow mode
     val listState = rememberLazyListState()
+
+    // Combined active scroll state for Google Drive-style fast scroll preview -> chunk-by-chunk sharpening
+    val isUserScrolling by remember {
+        derivedStateOf {
+            listState.isScrollInProgress || pagerState.isScrollInProgress || isZoomGestureScrolling
+        }
+    }
+
+    // Immediately hide ball when scrolling starts; only reveal ball when scrolling stops AND last scroll was upward
+    LaunchedEffect(isUserScrolling) {
+        if (isUserScrolling) {
+            if (barsVisible && !isOrbMenuOpen) {
+                barsVisible = false
+            }
+        } else {
+            delay(95)
+            if (!isUserScrolling && lastPdfScrollWasUp && !barsVisible) {
+                barsVisible = true
+            }
+        }
+    }
 
     // Fluid continuous Zoom & pan state with spring interpolation
     var zoomScale by remember { mutableFloatStateOf(1f) }
@@ -422,15 +462,20 @@ fun PdfViewerScreen(
         }
     }
 
-    // Adaptive NestedScroll connection to detect swipe-down (hide chrome) vs swipe-up (show chrome)
+    // Adaptive NestedScroll connection:
+    // Immediately hides floating ball & chrome on ANY scroll (up or down).
+    // Tracks whether the user's scroll direction was upward so the ball only comes back up after upward scrolling stops.
     val nestedScrollConnection = remember {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
                 if (zoomScale <= 1.05f) {
-                    if (available.y < -15f && barsVisible && !isOrbMenuOpen) {
+                    if (abs(available.y) > 4f && barsVisible && !isOrbMenuOpen) {
                         barsVisible = false
-                    } else if (available.y > 15f && !barsVisible) {
-                        barsVisible = true
+                    }
+                    if (available.y < -6f) {
+                        lastPdfScrollWasUp = false
+                    } else if (available.y > 6f) {
+                        lastPdfScrollWasUp = true
                     }
                 }
                 return Offset.Zero
@@ -513,7 +558,6 @@ fun PdfViewerScreen(
         // MAIN CONTENT AREA: SWIPEABLE PAGES WITH COMPRESSED GRAPHICS
         if (pageCount > 0 && renderEngine != null) {
             val engine = renderEngine!!
-            val densityForZoom = LocalDensity.current
 
             Box(
                 modifier = Modifier
@@ -538,7 +582,6 @@ fun PdfViewerScreen(
                             val ch = if (containerSize.height > 0) containerSize.height.toFloat() else 1920f
                             val centerX = cw / 2f
                             val centerY = ch / 2f
-                            var subPixelScrollRemainder = 0f
 
                             do {
                                 val event = awaitPointerEvent(PointerEventPass.Initial)
@@ -551,6 +594,10 @@ fun PdfViewerScreen(
                                     // TWO-FINGER GESTURE: Exact centroid focal-point pinch-to-zoom & pan
                                     isMultiTouch = true
                                     hasMoved = true
+                                    isZoomGestureScrolling = true
+                                    if (barsVisible && !isOrbMenuOpen) {
+                                        barsVisible = false
+                                    }
 
                                     val centroid = event.calculateCentroid(useCurrent = true)
                                     val rawZoom = event.calculateZoom()
@@ -605,6 +652,10 @@ fun PdfViewerScreen(
                                             if (dist > touchSlop || hasMoved) {
                                                 val panDelta = event.calculatePan()
                                                 if (panDelta != Offset.Zero) {
+                                                    isZoomGestureScrolling = true
+                                                    if (barsVisible && !isOrbMenuOpen) {
+                                                        barsVisible = false
+                                                    }
                                                     val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
                                                     panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
 
@@ -612,16 +663,21 @@ fun PdfViewerScreen(
                                                         // In Flow mode: Seamless 1:1 list scrolling in exact swipe direction
                                                         if (panDelta.y != 0f) {
                                                             applyFlowVerticalDelta(panDelta.y, zoomScale, ch)
-                                                            if (panDelta.y < -10f && barsVisible && !isOrbMenuOpen) {
-                                                                barsVisible = false
-                                                            } else if (panDelta.y > 10f && !barsVisible) {
-                                                                barsVisible = true
+                                                            if (panDelta.y < -6f) {
+                                                                lastPdfScrollWasUp = false
+                                                            } else if (panDelta.y > 6f) {
+                                                                lastPdfScrollWasUp = true
                                                             }
                                                         }
                                                     } else {
                                                         // In Page Swipe mode: Pan inside the current page
                                                         val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
                                                         panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
+                                                        if (panDelta.y < -6f) {
+                                                            lastPdfScrollWasUp = false
+                                                        } else if (panDelta.y > 6f) {
+                                                            lastPdfScrollWasUp = true
+                                                        }
                                                     }
                                                 }
                                                 change.consume()
@@ -650,9 +706,15 @@ fun PdfViewerScreen(
                                                 tween(280, easing = FastOutSlowInEasing)
                                             )
                                         } catch (_: Exception) {
+                                        } finally {
+                                            isZoomGestureScrolling = false
                                         }
                                     }
+                                } else {
+                                    isZoomGestureScrolling = false
                                 }
+                            } else {
+                                isZoomGestureScrolling = false
                             }
 
                             // Snap-back bounds checking on finger release
@@ -747,6 +809,7 @@ fun PdfViewerScreen(
                             colorFilter = paperColorFilter,
                             isSwipeMode = true,
                             isHighZoom = zoomScale >= 1.55f && abs(pageIdx - currentPageIndex) <= 1,
+                            isUserScrolling = isUserScrolling,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(
@@ -786,6 +849,7 @@ fun PdfViewerScreen(
                                 colorFilter = paperColorFilter,
                                 isSwipeMode = false,
                                 isHighZoom = zoomScale >= 1.55f && abs(pageIdx - currentPageIndex) <= 1,
+                                isUserScrolling = isUserScrolling,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(horizontal = 10.dp)

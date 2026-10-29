@@ -128,6 +128,11 @@ class MainActivity : ComponentActivity() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
             window.attributes.layoutInDisplayCutoutMode =
                 android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            window.navigationBarDividerColor = android.graphics.Color.TRANSPARENT
+        }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+            window.isStatusBarContrastEnforced = false
         }
         handleIntent(intent)
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -258,6 +263,9 @@ class WebScrollGuardState {
     @Volatile var isWebPageScrolledDown: Boolean = false
     @Volatile var touchStartedAtTop: Boolean = true
     @Volatile var isFirstSite: Boolean = true
+    @Volatile var isTouchActive: Boolean = false
+    @Volatile var lastScrollWasUp: Boolean = false
+    @Volatile var lastScrollEventTime: Long = 0L
 }
 
 @Composable
@@ -515,13 +523,24 @@ fun WebViewScreen(
     }
 
     // Root container with dynamically updated background
-    var themeColor by remember { mutableIntStateOf(android.graphics.Color.parseColor("#0288D1")) }
-        
+    var themeColor by remember { mutableIntStateOf(android.graphics.Color.parseColor("#090D16")) }
+
         SideEffect {
             (context as? Activity)?.window?.let { window ->
                 WindowCompat.setDecorFitsSystemWindows(window, false)
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                    window.navigationBarDividerColor = android.graphics.Color.TRANSPARENT
+                }
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    window.isNavigationBarContrastEnforced = false
+                    window.isStatusBarContrastEnforced = false
+                }
                 val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
-                if (customView == null) {
+                if (activePdfSource != null || customView != null) {
+                    windowInsetsController.systemBarsBehavior =
+                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
+                } else {
                     windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
                 }
                 @Suppress("DEPRECATION")
@@ -532,9 +551,11 @@ fun WebViewScreen(
                     window.statusBarColor = themeColor
                     window.navigationBarColor = themeColor
                 }
+                // Dark theme (isLight == false) -> status bar text/icons are WHITE (isAppearanceLightStatusBars = false)
+                // Light theme (isLight == true) -> status bar text/icons are DARK (isAppearanceLightStatusBars = true)
                 val isLight = (android.graphics.Color.red(themeColor) * 0.299 +
                         android.graphics.Color.green(themeColor) * 0.587 +
-                        android.graphics.Color.blue(themeColor) * 0.114) > 186
+                        android.graphics.Color.blue(themeColor) * 0.114) > 160
                 windowInsetsController.isAppearanceLightStatusBars = isLight
                 windowInsetsController.isAppearanceLightNavigationBars = isLight
             }
@@ -670,17 +691,35 @@ fun WebViewScreen(
                     }
 
                     val webViewInstance = WebView(ctx).apply {
+                        // Single zero-allocation Runnable that reveals the floating ball ONLY after
+                        // finger leaves the screen AND upward scrolling has completely stopped.
+                        val showBallWhenSettledRunnable = object : Runnable {
+                            override fun run() {
+                                if (scrollGuard.isFirstSite || scrollGuard.isTouchActive) return
+                                val elapsed = System.currentTimeMillis() - scrollGuard.lastScrollEventTime
+                                if (elapsed < 135L) {
+                                    postDelayed(this, 145L - elapsed)
+                                    return
+                                }
+                                if (scrollGuard.lastScrollWasUp && !isWebBallVisible) {
+                                    isWebBallVisible = true
+                                }
+                            }
+                        }
+
                         val jsInterface = WebAppInterface(
                             onColorReceived = { colorStr ->
                                 try {
                                     val parsed = android.graphics.Color.parseColor(colorStr)
-                                    (ctx as? Activity)?.runOnUiThread {
-                                        themeColor = parsed
+                                    post {
+                                        if (themeColor != parsed) {
+                                            themeColor = parsed
+                                        }
                                     }
                                 } catch (e: Exception) { e.printStackTrace() }
                             },
                             onSettingsUpdateReceived = { jsonStr ->
-                                (ctx as? Activity)?.runOnUiThread {
+                                post {
                                     try {
                                         val prefs = ctx.getSharedPreferences("StudyVersePrefs", Context.MODE_PRIVATE)
                                         val oldRulesStr = prefs.getString("domain_rules", "{}")
@@ -714,12 +753,12 @@ fun WebViewScreen(
                                 }
                             },
                             onChunkLoadErrorReceived = { errorDetails ->
-                                (ctx as? Activity)?.runOnUiThread {
+                                post {
                                     triggerSiteUpdateRecovery("chunk_error: $errorDetails")
                                 }
                             },
                             onBlankContentReceived = {
-                                (ctx as? Activity)?.runOnUiThread {
+                                post {
                                     triggerSiteUpdateRecovery("blank_body")
                                 }
                             },
@@ -731,11 +770,16 @@ fun WebViewScreen(
                             },
                             onScrollDirectionChanged = { scrollingDown ->
                                 if (!scrollGuard.isFirstSite) {
-                                    (ctx as? Activity)?.runOnUiThread {
-                                        if (scrollingDown) {
-                                            if (!isWebOrbMenuOpen && isWebBallVisible) isWebBallVisible = false
-                                        } else {
-                                            if (!isWebBallVisible) isWebBallVisible = true
+                                    scrollGuard.lastScrollWasUp = !scrollingDown
+                                    scrollGuard.lastScrollEventTime = System.currentTimeMillis()
+                                    post {
+                                        // Immediately hide ball while scrolling in ANY direction (up or down)
+                                        if (!isWebOrbMenuOpen && isWebBallVisible) {
+                                            isWebBallVisible = false
+                                        }
+                                        removeCallbacks(showBallWhenSettledRunnable)
+                                        if (!scrollGuard.isTouchActive && scrollGuard.lastScrollWasUp) {
+                                            postDelayed(showBallWhenSettledRunnable, 160L)
                                         }
                                     }
                                 }
@@ -755,7 +799,8 @@ fun WebViewScreen(
                         isVerticalScrollBarEnabled = false
                         isHorizontalScrollBarEnabled = false
 
-                        // Native WebView scroll listener for hiding ball on scroll down & showing on scroll up
+                        // Native WebView scroll listener:
+                        // Immediately hides ball on ANY scroll (up or down) and schedules settle check if upward
                         setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
                             if (scrollY > 0) {
                                 scrollGuard.isWebPageScrolledDown = true
@@ -765,35 +810,67 @@ fun WebViewScreen(
                             }
                             if (!scrollGuard.isFirstSite) {
                                 val dy = scrollY - oldScrollY
-                                if (dy > 12 && !isWebOrbMenuOpen && isWebBallVisible) {
-                                    isWebBallVisible = false
-                                } else if ((dy < -12 || scrollY <= 4) && !isWebBallVisible) {
-                                    isWebBallVisible = true
+                                if (kotlin.math.abs(dy) > 4) {
+                                    scrollGuard.lastScrollEventTime = System.currentTimeMillis()
+                                    if (dy > 4) {
+                                        scrollGuard.lastScrollWasUp = false
+                                    } else if (dy < -4) {
+                                        scrollGuard.lastScrollWasUp = true
+                                    }
+                                    if (!isWebOrbMenuOpen && isWebBallVisible) {
+                                        isWebBallVisible = false
+                                    }
+                                    removeCallbacks(showBallWhenSettledRunnable)
+                                    if (!scrollGuard.isTouchActive && scrollGuard.lastScrollWasUp) {
+                                        postDelayed(showBallWhenSettledRunnable, 160L)
+                                    }
                                 }
                             }
                         }
 
-                        // Touch listener to lock touchStartedAtTop on ACTION_DOWN so upward scroll never triggers refresh mid-swipe
+                        // Touch listener:
+                        // 1. Locks touchStartedAtTop on ACTION_DOWN so upward scroll never triggers refresh mid-swipe
+                        // 2. Immediately hides floating ball on ANY scroll drag (up or down)
+                        // 3. Only shows floating ball after finger leaves screen (ACTION_UP/CANCEL) AND last scroll was upward
                         var lastTouchY = 0f
                         setOnTouchListener { v, event ->
                             when (event.actionMasked) {
                                 android.view.MotionEvent.ACTION_DOWN -> {
                                     lastTouchY = event.y
+                                    scrollGuard.isTouchActive = true
+                                    removeCallbacks(showBallWhenSettledRunnable)
                                     val wv = v as? WebView
                                     val atTopNow = (wv == null || (wv.scrollY <= 0 && !wv.canScrollVertically(-1))) && !scrollGuard.isWebPageScrolledDown
                                     scrollGuard.touchStartedAtTop = atTopNow
                                 }
                                 android.view.MotionEvent.ACTION_MOVE -> {
+                                    scrollGuard.isTouchActive = true
                                     if (!scrollGuard.isFirstSite) {
                                         val dy = event.y - lastTouchY
-                                        if (dy < -22f) {
-                                            // Finger dragging upward -> scrolling page down -> hide ball underneath
-                                            if (!isWebOrbMenuOpen && isWebBallVisible) isWebBallVisible = false
+                                        if (kotlin.math.abs(dy) > 14f) {
+                                            scrollGuard.lastScrollEventTime = System.currentTimeMillis()
+                                            // Immediately hide ball when scrolling starts (whether scrolling up or down)
+                                            if (!isWebOrbMenuOpen && isWebBallVisible) {
+                                                isWebBallVisible = false
+                                            }
+                                            if (dy < -14f) {
+                                                // Finger dragging upward -> scrolling page down
+                                                scrollGuard.lastScrollWasUp = false
+                                            } else if (dy > 14f) {
+                                                // Finger dragging downward -> scrolling page up
+                                                scrollGuard.lastScrollWasUp = true
+                                            }
                                             lastTouchY = event.y
-                                        } else if (dy > 22f) {
-                                            // Finger dragging downward -> scrolling page up -> bring ball back up
-                                            if (!isWebBallVisible) isWebBallVisible = true
-                                            lastTouchY = event.y
+                                        }
+                                    }
+                                }
+                                android.view.MotionEvent.ACTION_UP,
+                                android.view.MotionEvent.ACTION_CANCEL -> {
+                                    scrollGuard.isTouchActive = false
+                                    if (!scrollGuard.isFirstSite) {
+                                        removeCallbacks(showBallWhenSettledRunnable)
+                                        if (scrollGuard.lastScrollWasUp) {
+                                            postDelayed(showBallWhenSettledRunnable, 160L)
                                         }
                                     }
                                 }
@@ -1205,28 +1282,96 @@ fun WebViewScreen(
                                             if (!bgColor || !bgColor.startsWith('rgb')) return null;
                                             var match = bgColor.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([0-9.]+))?\)/);
                                             if (!match) return null;
-                                            if (match[4] !== undefined && parseFloat(match[4]) < 0.08) return null;
+                                            if (match[4] !== undefined && parseFloat(match[4]) < 0.12) return null;
                                             var r = parseInt(match[1]).toString(16).padStart(2, '0');
                                             var g = parseInt(match[2]).toString(16).padStart(2, '0');
                                             var b = parseInt(match[3]).toString(16).padStart(2, '0');
                                             return '#' + r + g + b;
                                         }
+                                        function detectExplicitThemeMode() {
+                                            var html = document.documentElement;
+                                            var body = document.body;
+                                            var checkNodes = [html, body];
+                                            for (var i = 0; i < checkNodes.length; i++) {
+                                                var el = checkNodes[i];
+                                                if (!el) continue;
+                                                if (el.classList) {
+                                                    if (el.classList.contains('dark') || el.classList.contains('theme-dark') || el.classList.contains('dark-mode')) return 'dark';
+                                                    if (el.classList.contains('light') || el.classList.contains('theme-light') || el.classList.contains('light-mode')) return 'light';
+                                                }
+                                                var dt = (el.getAttribute('data-theme') || el.getAttribute('data-mode') || el.getAttribute('data-color-scheme') || '').toLowerCase();
+                                                if (dt.indexOf('dark') !== -1) return 'dark';
+                                                if (dt.indexOf('light') !== -1) return 'light';
+                                                if (el.style && el.style.colorScheme) {
+                                                    var cs = el.style.colorScheme.toLowerCase();
+                                                    if (cs === 'dark') return 'dark';
+                                                    if (cs === 'light') return 'light';
+                                                }
+                                            }
+                                            try {
+                                                var stored = (localStorage.getItem('theme') || localStorage.getItem('color-theme') || localStorage.getItem('studyverse-theme') || '').toLowerCase();
+                                                if (stored === 'dark') return 'dark';
+                                                if (stored === 'light') return 'light';
+                                            } catch (e) {}
+                                            return null;
+                                        }
+                                        function getVisibleBackgroundHex() {
+                                            var selectors = [document.body, document.documentElement];
+                                            var rootEl = document.querySelector('#__next, #root, main, [data-theme], .app, .min-h-screen');
+                                            if (rootEl) selectors.unshift(rootEl);
+                                            for (var i = 0; i < selectors.length; i++) {
+                                                var el = selectors[i];
+                                                if (!el) continue;
+                                                var hex = parseRgbToHex(window.getComputedStyle(el).backgroundColor);
+                                                if (hex) return hex;
+                                            }
+                                            return null;
+                                        }
+                                        function hexLuminance(hex) {
+                                            if (!hex || hex.charAt(0) !== '#' || hex.length < 7) return null;
+                                            var r = parseInt(hex.substr(1, 2), 16);
+                                            var g = parseInt(hex.substr(3, 2), 16);
+                                            var b = parseInt(hex.substr(5, 2), 16);
+                                            return r * 0.299 + g * 0.587 + b * 0.114;
+                                        }
                                         function sendColor() {
+                                            var isMainSite = window.location.hostname.indexOf('study-verse-lime.vercel.app') !== -1;
+                                            var explicitMode = detectExplicitThemeMode();
+                                            var bgHex = getVisibleBackgroundHex();
                                             var resolved = null;
-                                            var metaThemeColor = document.querySelector('meta[name="theme-color"]');
-                                            if (metaThemeColor && metaThemeColor.content && metaThemeColor.content.trim().length > 0) {
-                                                resolved = metaThemeColor.content.trim();
+
+                                            if (isMainSite) {
+                                                // On our main site, status bar is transparent and text color must strictly follow Dark (white text) vs Light (dark text)
+                                                if (explicitMode === 'dark') {
+                                                    var lumD = hexLuminance(bgHex);
+                                                    resolved = (bgHex && lumD !== null && lumD < 150) ? bgHex : '#090D16';
+                                                } else if (explicitMode === 'light') {
+                                                    var lumL = hexLuminance(bgHex);
+                                                    resolved = (bgHex && lumL !== null && lumL >= 150) ? bgHex : '#FFFFFF';
+                                                } else if (bgHex) {
+                                                    resolved = bgHex;
+                                                } else {
+                                                    resolved = '#090D16';
+                                                }
+                                            } else {
+                                                // On external sites, color status & nav bars by site theme
+                                                var metaThemeColor = document.querySelector('meta[name="theme-color"]');
+                                                if (explicitMode === 'dark' && bgHex && hexLuminance(bgHex) < 150) {
+                                                    resolved = bgHex;
+                                                } else if (explicitMode === 'light' && bgHex && hexLuminance(bgHex) >= 150) {
+                                                    resolved = bgHex;
+                                                } else if (metaThemeColor && metaThemeColor.content && metaThemeColor.content.trim().length > 0) {
+                                                    resolved = metaThemeColor.content.trim();
+                                                } else if (bgHex) {
+                                                    resolved = bgHex;
+                                                } else if (explicitMode === 'dark') {
+                                                    resolved = '#0F172A';
+                                                } else {
+                                                    resolved = '#FFFFFF';
+                                                }
                                             }
-                                            if (!resolved && document.body) {
-                                                resolved = parseRgbToHex(window.getComputedStyle(document.body).backgroundColor);
-                                            }
-                                            if (!resolved && document.documentElement) {
-                                                resolved = parseRgbToHex(window.getComputedStyle(document.documentElement).backgroundColor);
-                                            }
-                                            if (!resolved) {
-                                                resolved = '#FFFFFF';
-                                            }
-                                            if (resolved !== window.__studyverse_last_theme_color) {
+
+                                            if (resolved && resolved !== window.__studyverse_last_theme_color) {
                                                 window.__studyverse_last_theme_color = resolved;
                                                 if (window.AndroidInterface && window.AndroidInterface.postThemeColor) {
                                                     window.AndroidInterface.postThemeColor(resolved);
@@ -1243,11 +1388,15 @@ fun WebViewScreen(
                                                 observer.observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['content'] });
                                             }
                                             if (document.documentElement) {
-                                                observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class', 'data-theme'] });
+                                                observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class', 'data-theme', 'data-mode', 'data-color-scheme'] });
                                             }
                                             if (document.body) {
-                                                observer.observe(document.body, { attributes: true, attributeFilter: ['style', 'class', 'data-theme'] });
+                                                observer.observe(document.body, { attributes: true, attributeFilter: ['style', 'class', 'data-theme', 'data-mode', 'data-color-scheme'] });
                                             }
+                                            window.addEventListener('click', function() {
+                                                setTimeout(sendColor, 60);
+                                                setTimeout(sendColor, 240);
+                                            }, { passive: true });
                                         }
                                     })();
                                 """.trimIndent(), null)
@@ -1281,7 +1430,6 @@ fun WebViewScreen(
                                         if (!window.__studyverse_scroll_guard_installed) {
                                             window.__studyverse_scroll_guard_installed = true;
                                             var lastReportedScrolled = null;
-                                            var lastReportedDir = null;
                                             var lastScrollCheckTime = 0;
                                             var scrolledTargets = [];
                                             var lastScrollPosMap = new WeakMap();
@@ -1311,38 +1459,38 @@ fun WebViewScreen(
 
                                             function onScrollCapture(e) {
                                                 var now = Date.now();
-                                                if (now - lastScrollCheckTime < 90) return;
+                                                if (now - lastScrollCheckTime < 100) return;
                                                 lastScrollCheckTime = now;
 
                                                 var t = e ? e.target : null;
-                                                var newDir = null;
+                                                var isMainSite = window.location.hostname.indexOf('study-verse-lime.vercel.app') !== -1;
+
                                                 if (t && t !== document && t !== window && t.scrollTop !== undefined) {
                                                     if (scrolledTargets.indexOf(t) === -1 && scrolledTargets.length < 12) {
                                                         scrolledTargets.push(t);
                                                     }
-                                                    var prev = lastScrollPosMap.get(t) || 0;
-                                                    var cur = t.scrollTop || 0;
-                                                    if (cur - prev > 10) {
-                                                        newDir = true;
-                                                    } else if (cur - prev < -10 || cur <= 2) {
-                                                        newDir = false;
+                                                    if (!isMainSite) {
+                                                        var prev = lastScrollPosMap.get(t) || 0;
+                                                        var cur = t.scrollTop || 0;
+                                                        var dy = cur - prev;
+                                                        if (Math.abs(dy) > 6) {
+                                                            if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
+                                                                window.AndroidApp.reportScrollDirection(dy > 0);
+                                                            }
+                                                        }
+                                                        lastScrollPosMap.set(t, cur);
                                                     }
-                                                    lastScrollPosMap.set(t, cur);
-                                                } else {
+                                                } else if (!isMainSite) {
                                                     var curWin = getWinScroll();
-                                                    if (curWin - lastWinScroll > 10) {
-                                                        newDir = true;
-                                                    } else if (curWin - lastWinScroll < -10 || curWin <= 2) {
-                                                        newDir = false;
+                                                    var dyWin = curWin - lastWinScroll;
+                                                    if (Math.abs(dyWin) > 6) {
+                                                        if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
+                                                            window.AndroidApp.reportScrollDirection(dyWin > 0);
+                                                        }
                                                     }
                                                     lastWinScroll = curWin;
                                                 }
-                                                if (newDir !== null && newDir !== lastReportedDir) {
-                                                    lastReportedDir = newDir;
-                                                    if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
-                                                        window.AndroidApp.reportScrollDirection(newDir);
-                                                    }
-                                                }
+
                                                 var scrolled = checkAnyScrolledFast(t);
                                                 if (scrolled !== lastReportedScrolled) {
                                                     lastReportedScrolled = scrolled;
@@ -2238,36 +2386,33 @@ fun WebFloatingBallChromeMenu(
     onClose: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val menuBgBrush = remember {
+        Brush.verticalGradient(
+            listOf(
+                Color(0xFF1B2436),
+                Color(0xFF101726),
+                Color(0xFF0A0F1A)
+            )
+        )
+    }
+    val menuBorderBrush = remember {
+        Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.28f),
+                Color.White.copy(alpha = 0.08f)
+            )
+        )
+    }
     Surface(
         shape = RoundedCornerShape(26.dp),
         color = Color.Transparent,
-        modifier = modifier
-            .widthIn(max = 340.dp)
-            .shadow(24.dp, RoundedCornerShape(26.dp), spotColor = Color.Black.copy(alpha = 0.75f))
+        shadowElevation = 6.dp,
+        modifier = modifier.widthIn(max = 340.dp)
     ) {
         Box(
             modifier = Modifier
-                .background(
-                    Brush.verticalGradient(
-                        listOf(
-                            Color(0xFF1B2436).copy(alpha = 0.97f),
-                            Color(0xFF101726).copy(alpha = 0.99f),
-                            Color(0xFF0A0F1A)
-                        )
-                    )
-                )
-                .border(
-                    BorderStroke(
-                        1.1.dp,
-                        Brush.verticalGradient(
-                            listOf(
-                                Color.White.copy(alpha = 0.28f),
-                                Color.White.copy(alpha = 0.08f)
-                            )
-                        )
-                    ),
-                    RoundedCornerShape(26.dp)
-                )
+                .background(menuBgBrush)
+                .border(BorderStroke(1.1.dp, menuBorderBrush), RoundedCornerShape(26.dp))
                 .padding(horizontal = 16.dp, vertical = 14.dp)
                 .clickable(
                     indication = null,

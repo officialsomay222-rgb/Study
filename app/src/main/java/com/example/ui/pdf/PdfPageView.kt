@@ -41,35 +41,52 @@ fun PdfSinglePageView(
     colorFilter: ColorFilter? = null,
     isSwipeMode: Boolean = true,
     isHighZoom: Boolean = false,
+    isUserScrolling: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     var pageBitmap by remember(pageIndex, engine) {
-        mutableStateOf(engine.getCachedBitmap(pageIndex, ultraHd = isHighZoom))
+        mutableStateOf(
+            if (isUserScrolling) {
+                engine.getCachedPreviewOnly(pageIndex) ?: engine.getCachedBitmap(pageIndex, ultraHd = false)
+            } else {
+                engine.getCachedBitmap(pageIndex, ultraHd = isHighZoom)
+            }
+        )
     }
+    var wasScrolling by remember(pageIndex, engine) { mutableStateOf(false) }
 
-    // Load High-DPI base bitmap immediately if not already cached
-    LaunchedEffect(pageIndex, engine) {
-        if (pageBitmap == null) {
-            val bmp = engine.getPageBitmap(pageIndex, ultraHd = false)
-            if (bmp != null) {
-                pageBitmap = bmp
+    // 1. Ensure fast low-res preview is loaded immediately so no page is blank while scrolling
+    LaunchedEffect(pageIndex, engine, isUserScrolling) {
+        if (isUserScrolling) {
+            wasScrolling = true
+            val preview = engine.getCachedPreviewOnly(pageIndex) ?: engine.getPreviewBitmap(pageIndex)
+            if (preview != null) {
+                pageBitmap = preview
+            }
+        } else if (pageBitmap == null) {
+            val preview = engine.getPreviewBitmap(pageIndex)
+            if (preview != null && pageBitmap == null) {
+                pageBitmap = preview
             }
         }
     }
 
-    // Seamlessly upgrade in-place to Ultra-HD bitmap after zoom gesture settles
-    LaunchedEffect(pageIndex, engine, isHighZoom) {
-        if (isHighZoom) {
-            val cachedUltra = engine.getCachedBitmap(pageIndex, ultraHd = true)
-            if (cachedUltra != null) {
-                pageBitmap = cachedUltra
-            } else {
-                kotlinx.coroutines.delay(260)
-                val ultraBmp = engine.getPageBitmap(pageIndex, ultraHd = true)
-                if (ultraBmp != null) {
-                    pageBitmap = ultraBmp
-                }
+    // 2. When scrolling stops (or when zoomed in), progressively sharpen text chunk-by-chunk (Google Drive style)
+    LaunchedEffect(pageIndex, engine, isUserScrolling, isHighZoom) {
+        if (!isUserScrolling) {
+            if (wasScrolling || isHighZoom) {
+                kotlinx.coroutines.delay(85)
             }
+            val shouldForceChunks = wasScrolling
+            engine.renderPageInChunks(
+                pageIndex = pageIndex,
+                ultraHd = isHighZoom,
+                totalChunks = 4,
+                forceChunkReveal = shouldForceChunks
+            ) { chunkBitmap, _ ->
+                pageBitmap = chunkBitmap
+            }
+            wasScrolling = false
         }
     }
 
@@ -86,12 +103,6 @@ fun PdfSinglePageView(
                     Modifier
                         .fillMaxSize()
                         .padding(horizontal = 4.dp, vertical = 6.dp)
-                        .shadow(
-                            elevation = 5.dp,
-                            shape = RoundedCornerShape(8.dp),
-                            ambientColor = Color.Black.copy(alpha = 0.4f),
-                            spotColor = Color.Black.copy(alpha = 0.55f)
-                        )
                         .clip(RoundedCornerShape(8.dp))
                         .border(BorderStroke(0.5.dp, Color.White.copy(alpha = 0.18f)), RoundedCornerShape(8.dp))
                         .background(Color.White)
@@ -100,12 +111,6 @@ fun PdfSinglePageView(
                         .fillMaxWidth()
                         .padding(horizontal = 4.dp, vertical = 3.dp)
                         .aspectRatio(aspect)
-                        .shadow(
-                            elevation = 4.dp,
-                            shape = RoundedCornerShape(6.dp),
-                            ambientColor = Color.Black.copy(alpha = 0.35f),
-                            spotColor = Color.Black.copy(alpha = 0.5f)
-                        )
                         .clip(RoundedCornerShape(6.dp))
                         .border(BorderStroke(0.5.dp, Color.Black.copy(alpha = 0.12f)), RoundedCornerShape(6.dp))
                         .background(Color.White)
@@ -117,7 +122,7 @@ fun PdfSinglePageView(
                     contentDescription = "Page ${pageIndex + 1}",
                     contentScale = if (isSwipeMode) ContentScale.Fit else ContentScale.FillWidth,
                     colorFilter = colorFilter,
-                    filterQuality = FilterQuality.Medium,
+                    filterQuality = if (isUserScrolling) FilterQuality.Low else FilterQuality.Medium,
                     modifier = if (isSwipeMode) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight()
                 )
             }

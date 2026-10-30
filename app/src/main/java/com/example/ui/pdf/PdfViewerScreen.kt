@@ -129,6 +129,8 @@ fun PdfViewerScreen(
     // 3px visible gap situated strictly after camera notch
     val notchGap = with(LocalDensity.current) { 3.toDp() }
     val topBarNotchSafePadding = safeCutout + notchGap
+    // Exact clearance so Page 1 starts cleanly below the PDF name capsule and the last page ends with the same space
+    val pdfCapsuleClearance = topBarNotchSafePadding + 58.dp
 
     // True Game Mode Immersive Fullscreen:
     // Content renders 100% edge-to-edge across the entire screen including cutout/navigation areas.
@@ -875,13 +877,15 @@ fun PdfViewerScreen(
                             isUserScrolling = isUserScrolling,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .padding(horizontal = 2.dp)
+                                .padding(horizontal = 2.dp, vertical = pdfCapsuleClearance)
                         )
                     }
                 } else {
                     // CONTINUOUS VERTICAL FLOW:
                     // When zoomScale < 1f (e.g. 0.75x), LazyColumn stays 100% full-screen height so there is ZERO
                     // top or bottom viewport gap when scrolling upside/downside, while each page scales to zoomScale width & height.
+                    // Top and bottom contentPadding match pdfCapsuleClearance so the first page starts cleanly after
+                    // the PDF name capsule and the end page has the exact same space at the bottom.
                     LazyColumn(
                         state = listState,
                         userScrollEnabled = isNativeScrollEnabled,
@@ -895,7 +899,10 @@ fun PdfViewerScreen(
                                 translationX = if (zoomScale > 1f) panOffsetX else 0f
                                 translationY = if (zoomScale > 1f) panOffsetY else 0f
                             },
-                        contentPadding = PaddingValues(vertical = 0.dp),
+                        contentPadding = PaddingValues(
+                            top = pdfCapsuleClearance,
+                            bottom = pdfCapsuleClearance
+                        ),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         items(

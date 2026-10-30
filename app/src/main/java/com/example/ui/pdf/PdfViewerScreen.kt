@@ -474,6 +474,13 @@ fun PdfViewerScreen(
                     errorMessage = null
                     isDownloading = false
                     lastError = null
+                    withContext(Dispatchers.Main) {
+                        try {
+                            listState.scrollToItem(0)
+                            pagerState.scrollToPage(0)
+                        } catch (_: Throwable) {
+                        }
+                    }
                     break
                 } catch (e: Exception) {
                     e.printStackTrace()

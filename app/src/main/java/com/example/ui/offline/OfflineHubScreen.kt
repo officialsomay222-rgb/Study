@@ -31,7 +31,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ui.pdf.LiquidGlassButton
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
+
+private val CachedPrefixRegex = Regex("^(?:work_\\d+_|sanitized_\\d+_|repaired_\\d+_|converted_\\d+_|imp_\\d+_)+")
+
+private fun cleanCachedDisplayName(rawName: String): String {
+    return rawName.replace(CachedPrefixRegex, "").ifBlank { rawName }
+}
 
 @Composable
 fun OfflineHubScreen(
@@ -43,16 +51,24 @@ fun OfflineHubScreen(
     val context = LocalContext.current
     var cachedPdfs by remember { mutableStateOf<List<File>>(emptyList()) }
 
-    // Load available cached study PDFs and documents
+    // Load available cached study PDFs and documents off the main thread
     LaunchedEffect(Unit) {
-        val cacheFolder = File(context.cacheDir, "study_pdfs")
-        if (cacheFolder.exists()) {
-            val files = cacheFolder.listFiles { f -> 
-                f.extension.equals("pdf", ignoreCase = true) ||
-                f.extension.equals("docx", ignoreCase = true) ||
-                f.extension.equals("doc", ignoreCase = true)
+        cachedPdfs = withContext(Dispatchers.IO) {
+            val cacheFolder = File(context.cacheDir, "study_pdfs")
+            if (cacheFolder.exists()) {
+                val files = cacheFolder.listFiles { f ->
+                    f.isFile && f.length() > 0L && (
+                        f.extension.equals("pdf", ignoreCase = true) ||
+                        f.extension.equals("docx", ignoreCase = true) ||
+                        f.extension.equals("doc", ignoreCase = true)
+                    )
+                }
+                files?.sortedByDescending { it.lastModified() }
+                    ?.distinctBy { cleanCachedDisplayName(it.name).lowercase() }
+                    ?.toList() ?: emptyList()
+            } else {
+                emptyList()
             }
-            cachedPdfs = files?.sortedByDescending { it.lastModified() }?.toList() ?: emptyList()
         }
     }
 
@@ -269,6 +285,7 @@ fun OfflineHubScreen(
                 items(cachedPdfs) { file ->
                     val kbSize = file.length() / 1024
                     val sizeLabel = if (kbSize > 1024) "${kbSize / 1024} MB" else "$kbSize KB"
+                    val cleanName = cleanCachedDisplayName(file.name)
 
                     Surface(
                         shape = RoundedCornerShape(16.dp),
@@ -276,7 +293,7 @@ fun OfflineHubScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable {
-                                onOpenPdf(file.absolutePath, file.name)
+                                onOpenPdf(file.absolutePath, cleanName)
                             }
                     ) {
                         Row(
@@ -324,7 +341,7 @@ fun OfflineHubScreen(
 
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = file.name,
+                                    text = cleanName,
                                     color = Color.White,
                                     fontSize = 14.sp,
                                     fontWeight = FontWeight.SemiBold,

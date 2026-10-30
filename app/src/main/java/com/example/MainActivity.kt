@@ -196,6 +196,20 @@ class MainActivity : ComponentActivity() {
         } catch (_: Throwable) {}
     }
 
+    override fun onPause() {
+        try {
+            webViewInstance?.onPause()
+        } catch (_: Throwable) {}
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        try {
+            webViewInstance?.onResume()
+        } catch (_: Throwable) {}
+    }
+
     override fun onDestroy() {
         webViewInstance = null
         super.onDestroy()
@@ -1072,15 +1086,22 @@ fun WebViewScreen(
                                     userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
                                 }
                                 newWebView.webChromeClient = this
-                                 newWebView.webViewClient = object : WebViewClient() {
-                                    override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
-                                        val targetUrl = req?.url?.toString() ?: return false
-                                        if (targetUrl.endsWith(".pdf", ignoreCase = true) || 
-                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("html"))) {
+                                newWebView.webViewClient = object : WebViewClient() {
+                                    private fun handlePopupUrl(v: WebView?, targetUrl: String): Boolean {
+                                        val isDoc = targetUrl.endsWith(".pdf", ignoreCase = true) ||
+                                            targetUrl.endsWith(".docx", ignoreCase = true) ||
+                                            targetUrl.endsWith(".doc", ignoreCase = true) ||
+                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("html")) ||
+                                            (targetUrl.contains(".docx", ignoreCase = true) && !targetUrl.contains("html"))
+                                        if (isDoc) {
                                             (ctx as? Activity)?.runOnUiThread {
                                                 if (activePdfSource == null) {
                                                     activePdfSource = targetUrl
-                                                    activePdfTitle = URLUtil.guessFileName(targetUrl, null, "application/pdf")
+                                                    activePdfTitle = URLUtil.guessFileName(
+                                                        targetUrl,
+                                                        null,
+                                                        if (targetUrl.contains(".doc")) "application/msword" else "application/pdf"
+                                                    )
                                                 }
                                             }
                                         } else {
@@ -1089,27 +1110,22 @@ fun WebViewScreen(
                                                 view.loadUrl(targetUrl)
                                             }
                                         }
+                                        try {
+                                            v?.stopLoading()
+                                            v?.destroy()
+                                        } catch (_: Throwable) {}
                                         return true
                                     }
-                                    
+
+                                    override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
+                                        val targetUrl = req?.url?.toString() ?: return false
+                                        return handlePopupUrl(v, targetUrl)
+                                    }
+
                                     @Suppress("DEPRECATION")
                                     override fun shouldOverrideUrlLoading(v: WebView?, urlStr: String?): Boolean {
                                         val targetUrl = urlStr ?: return false
-                                        if (targetUrl.endsWith(".pdf", ignoreCase = true) || 
-                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("html"))) {
-                                            (ctx as? Activity)?.runOnUiThread {
-                                                if (activePdfSource == null) {
-                                                    activePdfSource = targetUrl
-                                                    activePdfTitle = URLUtil.guessFileName(targetUrl, null, "application/pdf")
-                                                }
-                                            }
-                                        } else {
-                                            if (activePdfSource == null) {
-                                                currentLoadedUrl = targetUrl
-                                                view.loadUrl(targetUrl)
-                                            }
-                                        }
-                                        return true
+                                        return handlePopupUrl(v, targetUrl)
                                     }
 
                                     override fun onRenderProcessGone(v: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {

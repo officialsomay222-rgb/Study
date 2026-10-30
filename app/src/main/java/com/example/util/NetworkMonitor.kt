@@ -13,15 +13,23 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 object NetworkMonitor {
 
     fun isOnline(context: Context): Boolean {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
-        val network = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(network) ?: return false
-        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+            val network = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(network) ?: return false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     fun observeNetwork(context: Context): Flow<Boolean> = callbackFlow {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val cm = try {
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        } catch (_: Throwable) {
+            null
+        }
         if (cm == null) {
             trySend(false)
             close()
@@ -47,16 +55,24 @@ object NetworkMonitor {
         // Send initial state
         trySend(isOnline(context))
 
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        cm.registerNetworkCallback(request, callback)
+        var isRegistered = false
+        try {
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(request, callback)
+            isRegistered = true
+        } catch (_: Throwable) {
+            // Protect against SecurityException or TooManyRequestsException on OEM devices
+        }
 
         awaitClose {
-            try {
-                cm.unregisterNetworkCallback(callback)
-            } catch (e: Exception) {
-                // Ignore if unregister fails
+            if (isRegistered) {
+                try {
+                    cm.unregisterNetworkCallback(callback)
+                } catch (_: Throwable) {
+                    // Ignore if unregister fails
+                }
             }
         }
     }.distinctUntilChanged()

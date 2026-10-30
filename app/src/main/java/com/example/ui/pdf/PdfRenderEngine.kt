@@ -3,19 +3,15 @@ package com.example.ui.pdf
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Matrix
-import android.graphics.Paint
-import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import android.util.LruCache
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -41,13 +37,14 @@ enum class PaperTheme {
 }
 
 /**
- * Google Drive-grade Progressive Chunk PDF Rendering Engine.
+ * Ultra-Smooth On-Demand ("DOM-style") PDF Rendering Engine.
  *
- * Designed for 120fps butter-smooth scrolling even on low-end devices:
- * 1. Instant Low-Res Preview (RGB_565) while actively scrolling so scroll frames never drop.
- * 2. Progressive Chunk-by-Chunk (4 horizontal bands) High-DPI sharpening as soon as scrolling settles.
- * 3. Dynamic Ultra-HD Zoom upgrade when zoomed in.
- * 4. Crash-safe lifecycle with atomic close guard and automatic OOM recovery.
+ * - Pre-computes page aspect ratios so LazyColumn items have exact final heights from frame 0
+ *   with zero layout jumps during fast scrolling.
+ * - Calls Bitmap.prepareToDraw() and caches ImageBitmap on Dispatchers.IO so GPU texture upload
+ *   never blocks the main UI thread.
+ * - Suspends heavy HD/Ultra-HD work while the user is actively scrolling so CPU/GPU power is used
+ *   strictly on demand when the user stops on a page.
  */
 class PdfRenderEngine(
     val file: File,
@@ -60,24 +57,67 @@ class PdfRenderEngine(
     @Volatile
     private var isClosed = false
 
+    @Volatile
+    var isUserActivelyScrolling: Boolean = false
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val renderMutex = Mutex()
 
+    // Exact width/height aspect ratios per page (prevents any LazyColumn height jump)
+    private val pageAspectRatios: FloatArray
+    private var defaultAspectRatio: Float = 0.7071f // Standard A4 portrait width/height
+
     // Cache keys:
-    // - pageIndex (0..9,999): Fast scroll preview bitmap (RGB_565)
+    // - pageIndex (0..9,999): Fast scroll preview bitmap
     // - pageIndex + 10,000: Full High-DPI crisp page bitmap
     // - pageIndex + 100,000: Ultra-HD zoomed page bitmap
-    private val maxCacheKb = ((Runtime.getRuntime().maxMemory() / 1024) / 5).toInt().coerceIn(24 * 1024, 96 * 1024)
+    private val maxCacheKb = ((Runtime.getRuntime().maxMemory() / 1024) / 4).toInt().coerceIn(32 * 1024, 128 * 1024)
     private val cache = object : LruCache<Int, Bitmap>(maxCacheKb) {
         override fun sizeOf(key: Int, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
+        override fun entryRemoved(evicted: Boolean, key: Int, oldValue: Bitmap?, newValue: Bitmap?) {
+            if (evicted && newValue == null) {
+                imageBitmapCache.remove(key)
+            }
+        }
     }
+    private val imageBitmapCache = LruCache<Int, ImageBitmap>(120)
 
     init {
         val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-        pfd = descriptor
-        val rend = PdfRenderer(descriptor)
-        renderer = rend
-        pageCount = rend.pageCount
+        try {
+            val rend = PdfRenderer(descriptor)
+            pfd = descriptor
+            renderer = rend
+            pageCount = rend.pageCount
+            pageAspectRatios = FloatArray(pageCount.coerceAtLeast(1))
+
+            // Read Page 0 dimensions immediately so every page has an accurate initial aspect ratio
+            if (pageCount > 0) {
+                try {
+                    val firstPage = rend.openPage(0)
+                    try {
+                        val w = firstPage.width.coerceAtLeast(1).toFloat()
+                        val h = firstPage.height.coerceAtLeast(1).toFloat()
+                        defaultAspectRatio = (w / h).coerceIn(0.2f, 5.0f)
+                    } finally {
+                        try {
+                            firstPage.close()
+                        } catch (_: Throwable) {
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+                for (i in 0 until pageCount) {
+                    pageAspectRatios[i] = defaultAspectRatio
+                }
+            }
+        } catch (e: Throwable) {
+            try {
+                descriptor.close()
+            } catch (_: Throwable) {
+            }
+            throw e
+        }
     }
 
     private fun previewKey(pageIndex: Int) = pageIndex
@@ -85,254 +125,261 @@ class PdfRenderEngine(
     private fun ultraHdKey(pageIndex: Int) = pageIndex + 100_000
 
     /**
-     * Synchronous fast-path lookup from memory cache.
-     * Returns the highest clarity bitmap currently cached for [pageIndex], or the preview bitmap if only preview is ready.
+     * Returns the exact width/height aspect ratio for [pageIndex] in O(1) time.
      */
-    fun getCachedBitmap(pageIndex: Int, ultraHd: Boolean = false): Bitmap? {
-        if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return null
-        if (ultraHd) {
-            cache.get(ultraHdKey(pageIndex))?.let { return it }
+    fun getPageAspectRatio(pageIndex: Int): Float {
+        if (pageIndex !in 0 until pageCount) return defaultAspectRatio
+        val ratio = pageAspectRatios[pageIndex]
+        return if (ratio > 0.05f) ratio else defaultAspectRatio
+    }
+
+    private fun storeBitmapAndPrepareGpu(key: Int, pageIndex: Int, bmp: Bitmap): ImageBitmap {
+        if (pageIndex in 0 until pageCount && bmp.height > 0) {
+            pageAspectRatios[pageIndex] = (bmp.width.toFloat() / bmp.height.toFloat()).coerceIn(0.2f, 5.0f)
         }
-        cache.get(hdKey(pageIndex))?.let { return it }
-        return cache.get(previewKey(pageIndex))
+        try {
+            bmp.prepareToDraw()
+        } catch (_: Throwable) {
+        }
+        val img = bmp.asImageBitmap()
+        cache.put(key, bmp)
+        imageBitmapCache.put(key, img)
+        return img
+    }
+
+    private fun getOrWrapImageBitmap(key: Int): ImageBitmap? {
+        val bmp = cache.get(key) ?: return null
+        if (bmp.isRecycled) {
+            cache.remove(key)
+            imageBitmapCache.remove(key)
+            return null
+        }
+        imageBitmapCache.get(key)?.let { return it }
+        val img = bmp.asImageBitmap()
+        imageBitmapCache.put(key, img)
+        return img
     }
 
     /**
-     * Returns the lightweight soft preview bitmap if cached (used during active scroll for 120fps Google Drive feel).
+     * Returns the lightweight soft preview ImageBitmap if cached.
+     */
+    fun getCachedPreviewImage(pageIndex: Int): ImageBitmap? {
+        if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return null
+        return getOrWrapImageBitmap(previewKey(pageIndex))
+    }
+
+    /**
+     * Returns the sharp High-DPI (or Ultra-HD) ImageBitmap if cached.
+     */
+    fun getCachedSharpImage(pageIndex: Int, ultraHd: Boolean = false): ImageBitmap? {
+        if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return null
+        if (ultraHd) {
+            getOrWrapImageBitmap(ultraHdKey(pageIndex))?.let { return it }
+        }
+        return getOrWrapImageBitmap(hdKey(pageIndex))
+    }
+
+    /**
+     * Returns the lightweight soft preview bitmap if cached.
      */
     fun getCachedPreviewOnly(pageIndex: Int): Bitmap? {
         if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return null
-        return cache.get(previewKey(pageIndex))
+        val bmp = cache.get(previewKey(pageIndex))
+        return if (bmp != null && !bmp.isRecycled) bmp else null
     }
 
     /**
-     * Returns true if the sharp High-DPI (or Ultra-HD when [ultraHd] is true) bitmap is already cached.
+     * Returns the sharp High-DPI (or Ultra-HD) bitmap if cached.
      */
-    fun isSharpBitmapCached(pageIndex: Int, ultraHd: Boolean = false): Boolean {
-        if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return false
-        return if (ultraHd) {
-            cache.get(ultraHdKey(pageIndex)) != null
-        } else {
-            cache.get(hdKey(pageIndex)) != null
+    fun getCachedSharpBitmap(pageIndex: Int, ultraHd: Boolean = false): Bitmap? {
+        if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return null
+        if (ultraHd) {
+            val ultra = cache.get(ultraHdKey(pageIndex))
+            if (ultra != null && !ultra.isRecycled) return ultra
         }
+        val hd = cache.get(hdKey(pageIndex))
+        return if (hd != null && !hd.isRecycled) hd else null
     }
 
     /**
-     * Renders or retrieves a lightweight low-res preview bitmap (RGB_565) in <8ms for zero-lag fast scrolling.
+     * Renders or retrieves a lightweight low-res preview ImageBitmap on demand for 120fps scrolling.
      */
-    suspend fun getPreviewBitmap(pageIndex: Int): Bitmap? = withContext(Dispatchers.IO) {
+    suspend fun getPreviewImage(pageIndex: Int): ImageBitmap? = withContext(Dispatchers.IO) {
         if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return@withContext null
-        cache.get(previewKey(pageIndex))?.let { return@withContext it }
+        getCachedPreviewImage(pageIndex)?.let { return@withContext it }
 
         renderMutex.withLock {
             if (isClosed) return@withContext null
-            cache.get(previewKey(pageIndex))?.let { return@withContext it }
+            getCachedPreviewImage(pageIndex)?.let { return@withContext it }
             val rend = renderer ?: return@withContext null
 
             try {
                 val page = rend.openPage(pageIndex)
-                val baseWidth = page.width.coerceAtLeast(1)
-                val baseHeight = page.height.coerceAtLeast(1)
-                val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
+                try {
+                    val baseWidth = page.width.coerceAtLeast(1)
+                    val baseHeight = page.height.coerceAtLeast(1)
+                    pageAspectRatios[pageIndex] = (baseWidth.toFloat() / baseHeight.toFloat()).coerceIn(0.2f, 5.0f)
+                    val heightOverWidth = baseHeight.toFloat() / baseWidth.toFloat()
 
-                // Soft lightweight preview (fast rasterization during scroll)
-                val previewWidth = 540
-                val previewHeight = (previewWidth * aspectRatio).roundToInt().coerceIn(80, 1100)
+                    val previewWidth = 500
+                    val previewHeight = (previewWidth * heightOverWidth).roundToInt().coerceIn(80, 1100)
 
-                val bmp = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.RGB_565)
-                val canvas = Canvas(bmp)
-                canvas.drawColor(Color.WHITE)
-                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                page.close()
+                    // PdfRenderer.Page.render strictly requires Bitmap.Config.ARGB_8888
+                    val bmp = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(bmp)
+                    canvas.drawColor(Color.WHITE)
+                    page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
 
-                cache.put(previewKey(pageIndex), bmp)
-                bmp
+                    storeBitmapAndPrepareGpu(previewKey(pageIndex), pageIndex, bmp)
+                } finally {
+                    try {
+                        page.close()
+                    } catch (_: Throwable) {
+                    }
+                }
             } catch (oom: OutOfMemoryError) {
                 cache.evictAll()
+                imageBitmapCache.evictAll()
                 null
-            } catch (_: Throwable) {
+            } catch (e: Throwable) {
+                e.printStackTrace()
                 null
             }
         }
     }
 
     /**
-     * Google Drive-style progressive chunk-by-chunk sharpener.
-     * Starts from the soft preview and sharpens the page in 4 horizontal chunks (top to bottom)
-     * after the user stops scrolling, emitting each intermediate sharpened state via [onChunkReady].
+     * Renders or retrieves the full High-DPI (or Ultra-HD when zoomed) sharp ImageBitmap on demand.
      */
-    suspend fun renderPageInChunks(
-        pageIndex: Int,
-        ultraHd: Boolean = false,
-        totalChunks: Int = 4,
-        forceChunkReveal: Boolean = false,
-        onChunkReady: (Bitmap, Int) -> Unit
-    ): Bitmap? = withContext(Dispatchers.IO) {
+    suspend fun getPageImage(pageIndex: Int, ultraHd: Boolean = false): ImageBitmap? = withContext(Dispatchers.IO) {
         if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return@withContext null
-
         val targetKey = if (ultraHd) ultraHdKey(pageIndex) else hdKey(pageIndex)
-        if (!forceChunkReveal) {
-            cache.get(targetKey)?.let { cached ->
-                onChunkReady(cached, totalChunks)
-                return@withContext cached
-            }
-        }
+        getOrWrapImageBitmap(targetKey)?.let { return@withContext it }
 
-        // Ensure we have a base preview first so we can composite sharp chunks onto it seamlessly
-        val basePreview = getPreviewBitmap(pageIndex)
+        // Do not waste CPU/GPU power on HD rendering while user is actively scrolling
+        if (isUserActivelyScrolling) return@withContext null
 
-        // Render the full sharp page bitmap inside the mutex, then reveal or stream chunks
-        val sharpFullBitmap: Bitmap? = cache.get(targetKey) ?: renderMutex.withLock {
-            if (isClosed) return@withLock null
-            cache.get(targetKey)?.let { return@withLock it }
-            val rend = renderer ?: return@withLock null
+        renderMutex.withLock {
+            if (isClosed || isUserActivelyScrolling) return@withContext null
+            getOrWrapImageBitmap(targetKey)?.let { return@withContext it }
+            val rend = renderer ?: return@withContext null
 
             try {
                 val page = rend.openPage(pageIndex)
-                val baseWidth = page.width.coerceAtLeast(1)
-                val baseHeight = page.height.coerceAtLeast(1)
-                val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
+                try {
+                    val baseWidth = page.width.coerceAtLeast(1)
+                    val baseHeight = page.height.coerceAtLeast(1)
+                    pageAspectRatios[pageIndex] = (baseWidth.toFloat() / baseHeight.toFloat()).coerceIn(0.2f, 5.0f)
+                    val heightOverWidth = baseHeight.toFloat() / baseWidth.toFloat()
 
-                val desiredWidth = if (ultraHd) {
-                    maxOf((baseWidth * screenDensity * 1.65f).roundToInt(), 1800).coerceIn(1560, 2100)
-                } else {
-                    maxOf((baseWidth * screenDensity * 1.18f).roundToInt(), 1280).coerceIn(1120, 1480)
+                    val desiredWidth = if (ultraHd) {
+                        maxOf((baseWidth * screenDensity * 1.50f).roundToInt(), 1600).coerceIn(1400, 1920)
+                    } else {
+                        maxOf((baseWidth * screenDensity * 1.12f).roundToInt(), 1160).coerceIn(1040, 1400)
+                    }
+
+                    val maxAllowedHeight = if (ultraHd) 2600 else 2040
+                    val rawHeight = (desiredWidth * heightOverWidth).roundToInt().coerceAtLeast(1)
+                    val (targetWidth, targetHeight) = if (rawHeight > maxAllowedHeight) {
+                        val clampedH = maxAllowedHeight
+                        val clampedW = (clampedH / heightOverWidth).roundToInt().coerceAtLeast(1)
+                        Pair(clampedW, clampedH)
+                    } else {
+                        Pair(desiredWidth, rawHeight)
+                    }
+
+                    val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(bmp)
+                    canvas.drawColor(Color.WHITE)
+                    page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                    val img = storeBitmapAndPrepareGpu(targetKey, pageIndex, bmp)
+                    if (!ultraHd && !isUserActivelyScrolling) {
+                        triggerPrefetchPreview(pageIndex)
+                    }
+                    img
+                } finally {
+                    try {
+                        page.close()
+                    } catch (_: Throwable) {
+                    }
                 }
-
-                val maxAllowedHeight = if (ultraHd) 2900 else 2200
-                val rawHeight = (desiredWidth * aspectRatio).roundToInt().coerceAtLeast(1)
-                val (targetWidth, targetHeight) = if (rawHeight > maxAllowedHeight) {
-                    val clampedH = maxAllowedHeight
-                    val clampedW = (clampedH / aspectRatio).roundToInt().coerceAtLeast(1)
-                    Pair(clampedW, clampedH)
-                } else {
-                    Pair(desiredWidth, rawHeight)
-                }
-
-                // RGB_565 uses 50% less memory than ARGB_8888 while keeping opaque white-paper text 100% crisp
-                val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.RGB_565)
-                val canvas = Canvas(bmp)
-                canvas.drawColor(Color.WHITE)
-                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                page.close()
-
-                cache.put(targetKey, bmp)
-                if (!ultraHd) {
-                    triggerPrefetchPreview(pageIndex)
-                }
-                bmp
             } catch (oom: OutOfMemoryError) {
                 cache.evictAll()
+                imageBitmapCache.evictAll()
                 System.gc()
-                if (ultraHd) cache.get(hdKey(pageIndex)) else renderFallbackPage(pageIndex)
-            } catch (_: Throwable) {
+                if (ultraHd) getCachedSharpImage(pageIndex, ultraHd = false) else renderFallbackPage(pageIndex)
+            } catch (e: Throwable) {
+                e.printStackTrace()
                 null
             }
         }
-
-        if (sharpFullBitmap == null) return@withContext null
-
-        // Progressive chunk-by-chunk reveal from top to bottom (Google Drive style)
-        if (basePreview != null && basePreview !== sharpFullBitmap && totalChunks > 1) {
-            try {
-                val w = sharpFullBitmap.width
-                val h = sharpFullBitmap.height
-                val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-                val fullDst = Rect(0, 0, w, h)
-
-                for (chunk in 1 until totalChunks) {
-                    currentCoroutineContext().ensureActive()
-                    if (isClosed) return@withContext sharpFullBitmap
-
-                    val chunkBottom = (h * chunk) / totalChunks
-                    val stepBmp = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
-                    val stepCanvas = Canvas(stepBmp)
-                    // Draw soft preview as background, then overlay sharpened top chunks [0..chunkBottom]
-                    stepCanvas.drawBitmap(basePreview, null, fullDst, paint)
-                    val sharpRect = Rect(0, 0, w, chunkBottom)
-                    stepCanvas.drawBitmap(sharpFullBitmap, sharpRect, sharpRect, null)
-
-                    onChunkReady(stepBmp, chunk)
-                    delay(28)
-                }
-            } catch (_: OutOfMemoryError) {
-                // Skip intermediate chunk allocation if memory is tight and jump straight to sharp bitmap
-            }
-        }
-
-        currentCoroutineContext().ensureActive()
-        onChunkReady(sharpFullBitmap, totalChunks)
-        sharpFullBitmap
     }
 
-    /**
-     * Direct full-page render helper (maintained for backward compatibility and tests).
-     */
-    suspend fun getPageBitmap(pageIndex: Int, ultraHd: Boolean = false): Bitmap? = withContext(Dispatchers.IO) {
-        if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return@withContext null
-        val targetKey = if (ultraHd) ultraHdKey(pageIndex) else hdKey(pageIndex)
-        cache.get(targetKey)?.let { return@withContext it }
-
-        var result: Bitmap? = null
-        renderPageInChunks(pageIndex = pageIndex, ultraHd = ultraHd, totalChunks = 1) { bmp, _ ->
-            result = bmp
-        }
-        result
-    }
-
-    private fun renderFallbackPage(pageIndex: Int): Bitmap? {
+    private fun renderFallbackPage(pageIndex: Int): ImageBitmap? {
         if (isClosed) return null
         val rend = renderer ?: return null
         return try {
             val page = rend.openPage(pageIndex)
-            val baseWidth = page.width.coerceAtLeast(1)
-            val baseHeight = page.height.coerceAtLeast(1)
-            val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
-            val targetWidth = 960
-            val targetHeight = (targetWidth * aspectRatio).roundToInt().coerceIn(100, 1800)
-            val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.RGB_565)
-            val canvas = Canvas(bmp)
-            canvas.drawColor(Color.WHITE)
-            page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            page.close()
-            cache.put(hdKey(pageIndex), bmp)
-            bmp
+            try {
+                val baseWidth = page.width.coerceAtLeast(1)
+                val baseHeight = page.height.coerceAtLeast(1)
+                val heightOverWidth = baseHeight.toFloat() / baseWidth.toFloat()
+                val targetWidth = 840
+                val targetHeight = (targetWidth * heightOverWidth).roundToInt().coerceIn(100, 1560)
+                val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bmp)
+                canvas.drawColor(Color.WHITE)
+                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                storeBitmapAndPrepareGpu(hdKey(pageIndex), pageIndex, bmp)
+            } finally {
+                try {
+                    page.close()
+                } catch (_: Throwable) {
+                }
+            }
         } catch (_: Throwable) {
             null
         }
     }
 
     /**
-     * Pre-renders lightweight previews of adjacent pages when idle so fast scrolling never hits a blank placeholder.
+     * Pre-renders lightweight previews of adjacent pages (+/- 2) only when idle so scrolling never hits a blank frame.
      */
     private fun triggerPrefetchPreview(currentIndex: Int) {
-        if (isClosed) return
+        if (isClosed || isUserActivelyScrolling) return
         scope.launch {
-            val prefetchIndices = listOf(currentIndex + 1, currentIndex - 1, currentIndex + 2)
+            val prefetchIndices = intArrayOf(currentIndex + 1, currentIndex - 1, currentIndex + 2)
             for (idx in prefetchIndices) {
-                if (isClosed) break
-                if (idx in 0 until pageCount && cache.get(previewKey(idx)) == null && cache.get(hdKey(idx)) == null) {
+                if (isClosed || isUserActivelyScrolling) break
+                if (idx in 0 until pageCount && getCachedPreviewOnly(idx) == null) {
                     if (renderMutex.tryLock()) {
                         try {
-                            if (!isClosed && cache.get(previewKey(idx)) == null && renderer != null) {
+                            if (!isClosed && !isUserActivelyScrolling && getCachedPreviewOnly(idx) == null && renderer != null) {
                                 val rend = renderer ?: break
                                 val page = rend.openPage(idx)
-                                val baseWidth = page.width.coerceAtLeast(1)
-                                val baseHeight = page.height.coerceAtLeast(1)
-                                val aspectRatio = baseHeight.toFloat() / baseWidth.toFloat()
-                                val previewWidth = 620
-                                val previewHeight = (previewWidth * aspectRatio).roundToInt().coerceIn(80, 1200)
+                                try {
+                                    val baseWidth = page.width.coerceAtLeast(1)
+                                    val baseHeight = page.height.coerceAtLeast(1)
+                                    pageAspectRatios[idx] = (baseWidth.toFloat() / baseHeight.toFloat()).coerceIn(0.2f, 5.0f)
+                                    val heightOverWidth = baseHeight.toFloat() / baseWidth.toFloat()
+                                    val previewWidth = 500
+                                    val previewHeight = (previewWidth * heightOverWidth).roundToInt().coerceIn(80, 1100)
 
-                                val bmp = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.RGB_565)
-                                val canvas = Canvas(bmp)
-                                canvas.drawColor(Color.WHITE)
-                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                                page.close()
+                                    val bmp = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.ARGB_8888)
+                                    val canvas = Canvas(bmp)
+                                    canvas.drawColor(Color.WHITE)
+                                    page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
 
-                                cache.put(previewKey(idx), bmp)
+                                    storeBitmapAndPrepareGpu(previewKey(idx), idx, bmp)
+                                } finally {
+                                    try {
+                                        page.close()
+                                    } catch (_: Throwable) {
+                                    }
+                                }
                             }
                         } catch (_: Throwable) {
-                            // Non-critical prefetch error
                         } finally {
                             renderMutex.unlock()
                         }
@@ -349,7 +396,6 @@ class PdfRenderEngine(
             scope.cancel()
         } catch (_: Throwable) {
         }
-        // Safely close PdfRenderer and ParcelFileDescriptor after any active render lock finishes
         CoroutineScope(Dispatchers.IO).launch {
             renderMutex.withLock {
                 try {
@@ -363,6 +409,7 @@ class PdfRenderEngine(
                 renderer = null
                 pfd = null
                 cache.evictAll()
+                imageBitmapCache.evictAll()
             }
         }
     }

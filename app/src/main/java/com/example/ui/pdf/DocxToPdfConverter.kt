@@ -331,69 +331,78 @@ object DocxToPdfConverter {
             return canvas
         }
 
-        var canvas = startNewPage()
+        try {
+            var canvas = startNewPage()
 
-        for (item in paragraphs) {
-            val paint = when {
-                item.isHeading && item.headingLevel <= 1 -> heading1Paint
-                item.isHeading -> heading2Paint
-                item.isBullet -> bulletPaint
-                else -> bodyPaint
+            for (item in paragraphs) {
+                val paint = when {
+                    item.isHeading && item.headingLevel <= 1 -> heading1Paint
+                    item.isHeading -> heading2Paint
+                    item.isBullet -> bulletPaint
+                    else -> bodyPaint
+                }
+
+                val prefix = if (item.isBullet) "  •  " else ""
+                val fullText = prefix + item.text
+
+                val textWidth = if (item.isBullet) contentWidth - 14 else contentWidth
+
+                val staticLayout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    StaticLayout.Builder.obtain(fullText, 0, fullText.length, paint, textWidth)
+                        .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                        .setLineSpacing(2.5f, 1.12f)
+                        .setIncludePad(false)
+                        .build()
+                } else {
+                    @Suppress("DEPRECATION")
+                    StaticLayout(
+                        fullText,
+                        paint,
+                        textWidth,
+                        Layout.Alignment.ALIGN_NORMAL,
+                        1.12f,
+                        2.5f,
+                        false
+                    )
+                }
+
+                val layoutHeight = staticLayout.height
+                val spacingBefore = if (item.isHeading) 14 else 6
+                val spacingAfter = if (item.isHeading) 8 else 6
+
+                // Check if paragraph fits on current page
+                if (currentY + spacingBefore + layoutHeight > pageHeight - marginBottom) {
+                    canvas = startNewPage()
+                } else {
+                    currentY += spacingBefore
+                }
+
+                canvas.save()
+                val drawX = if (item.isBullet) marginX + 14f else marginX.toFloat()
+                canvas.translate(drawX, currentY.toFloat())
+                staticLayout.draw(canvas)
+                canvas.restore()
+
+                currentY += layoutHeight + spacingAfter
             }
 
-            val prefix = if (item.isBullet) "  •  " else ""
-            val fullText = prefix + item.text
-
-            val textWidth = if (item.isBullet) contentWidth - 14 else contentWidth
-
-            val staticLayout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                StaticLayout.Builder.obtain(fullText, 0, fullText.length, paint, textWidth)
-                    .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                    .setLineSpacing(2.5f, 1.12f)
-                    .setIncludePad(false)
-                    .build()
-            } else {
-                @Suppress("DEPRECATION")
-                StaticLayout(
-                    fullText,
-                    paint,
-                    textWidth,
-                    Layout.Alignment.ALIGN_NORMAL,
-                    1.12f,
-                    2.5f,
-                    false
-                )
+            currentPage?.let {
+                drawPageFooter(currentCanvas!!, currentPageIndex, pageWidth, pageHeight)
+                pdfDocument.finishPage(it)
+                currentPage = null
             }
 
-            val layoutHeight = staticLayout.height
-            val spacingBefore = if (item.isHeading) 14 else 6
-            val spacingAfter = if (item.isHeading) 8 else 6
-
-            // Check if paragraph fits on current page
-            if (currentY + spacingBefore + layoutHeight > pageHeight - marginBottom) {
-                canvas = startNewPage()
-            } else {
-                currentY += spacingBefore
+            FileOutputStream(outputFile).use { fos ->
+                pdfDocument.writeTo(fos)
             }
-
-            canvas.save()
-            val drawX = if (item.isBullet) marginX + 14f else marginX.toFloat()
-            canvas.translate(drawX, currentY.toFloat())
-            staticLayout.draw(canvas)
-            canvas.restore()
-
-            currentY += layoutHeight + spacingAfter
+        } finally {
+            try {
+                currentPage?.let { pdfDocument.finishPage(it) }
+            } catch (_: Throwable) {}
+            try {
+                pdfDocument.close()
+            } catch (_: Throwable) {}
         }
-
-        currentPage?.let {
-            drawPageFooter(currentCanvas!!, currentPageIndex, pageWidth, pageHeight)
-            pdfDocument.finishPage(it)
-        }
-
-        FileOutputStream(outputFile).use { fos ->
-            pdfDocument.writeTo(fos)
-        }
-        pdfDocument.close()
     }
 
     private fun drawPageFooter(canvas: Canvas, pageNumber: Int, pageWidth: Int, pageHeight: Int) {

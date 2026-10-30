@@ -1,23 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    
+
+    <!-- Outer Orbital Aura Ring (Strictly inside 66dp safe zone: radius 31 around 54,54) -->
+    <path
+        android:pathData="M54,23 A31,31 0 1,1 53.99,23 Z"
+        android:strokeWidth="1.9"
+        android:fillColor="#00000000">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="23"
+                android:startY="23"
+                android:endX="85"
+                android:endY="85"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF00E5FF" />
+                <item android:offset="0.45" android:color="#FF38BDF8" />
+                <item android:offset="0.75" android:color="#FF818CF8" />
+                <item android:offset="1.0" android:color="#FFC084FC" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 3D Gyroscopic Tilted Orbital Ellipse 1 -->
     <group
-        android:scaleX="2.8"
-        android:scaleY="2.8"
-        android:translateX="20"
-        android:translateY="20">
-        <!-- Sleek minimalist book / graduation cap logo -->
-        <!-- Core Cap Top -->
+        android:pivotX="54"
+        android:pivotY="54"
+        android:rotation="28">
         <path
-            android:fillColor="#38BDF8"
-            android:pathData="M12 3L1 9L12 15L21 10.09V17H23V9M5 13.18V17.18L12 21L19 17.18V13.18L12 17L5 13.18Z" />
-        <!-- Subtle Glow/Highlight overlay -->
-        <path
-            android:fillColor="#7DD3FC"
-            android:pathData="M12 3L1 9L12 11.5L23 9L12 3Z"
-            android:fillAlpha="0.3" />
+            android:pathData="M24,54 A30,11.5 0 1,0 84,54 A30,11.5 0 1,0 24,54 Z"
+            android:strokeWidth="1.1"
+            android:strokeColor="#7800E5FF"
+            android:fillColor="#00000000" />
     </group>
+
+    <!-- 3D Gyroscopic Tilted Orbital Ellipse 2 -->
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:rotation="-32">
+        <path
+            android:pathData="M24,54 A30,11.5 0 1,0 84,54 A30,11.5 0 1,0 24,54 Z"
+            android:strokeWidth="1.1"
+            android:strokeColor="#78C084FC"
+            android:fillColor="#00000000" />
+    </group>
+
+    <!-- 3D Obsidian & Liquid-Glass Core Medallion Disc (radius 25.5) -->
+    <path
+        android:pathData="M54,28.5 A25.5,25.5 0 1,1 53.99,28.5 Z"
+        android:strokeWidth="1.5">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="54"
+                android:centerY="50"
+                android:gradientRadius="26"
+                android:type="radial">
+                <item android:offset="0.0" android:color="#FF192542" />
+                <item android:offset="0.65" android:color="#FF0B1120" />
+                <item android:offset="1.0" android:color="#FF050811" />
+            </gradient>
+        </aapt:attr>
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="28"
+                android:startY="28"
+                android:endX="80"
+                android:endY="80"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#B3FFFFFF" />
+                <item android:offset="0.4" android:color="#9900E5FF" />
+                <item android:offset="1.0" android:color="#99A855F7" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Top-Left Curved Glass Specular Lens Highlight -->
+    <path
+        android:pathData="M34,45 A22,22 0 0,1 66,33.5"
+        android:strokeWidth="1.6"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="34"
+                android:startY="33"
+                android:endX="66"
+                android:endY="45"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#80FFFFFF" />
+                <item android:offset="1.0" android:color="#00FFFFFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Lower Left Secondary Book Page Accent -->
+    <path
+        android:fillColor="#6600E5FF"
+        android:pathData="M53.4,66.2 L39.2,61.6 L39.2,59.4 L53.4,64.0 Z" />
+
+    <!-- Lower Right Secondary Book Page Accent -->
+    <path
+        android:fillColor="#66C084FC"
+        android:pathData="M54.6,66.2 L68.8,61.6 L68.8,59.4 L54.6,64.0 Z" />
+
+    <!-- Left Illuminated StudyVerse Book Wing (Cyan Gradient) -->
+    <path android:pathData="M53.5,63.2 L38.0,58.0 L38.0,46.8 L53.5,52.4 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="38"
+                android:startY="46.8"
+                android:endX="53.5"
+                android:endY="63.2"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF00E5FF" />
+                <item android:offset="1.0" android:color="#FF38BDF8" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Right Illuminated StudyVerse Book Wing (Royal Indigo-Violet Gradient) -->
+    <path android:pathData="M54.5,63.2 L70.0,58.0 L70.0,46.8 L54.5,52.4 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54.5"
+                android:startY="46.8"
+                android:endX="70"
+                android:endY="63.2"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF818CF8" />
+                <item android:offset="1.0" android:color="#FFC084FC" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Levitating Diamond Knowledge Prism above the Book Spine -->
+    <path android:pathData="M54,35.2 L60.2,42.2 L54,49.2 L47.8,42.2 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="47.8"
+                android:startY="35.2"
+                android:endX="60.2"
+                android:endY="49.2"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FFFFFFFF" />
+                <item android:offset="0.5" android:color="#FF00E5FF" />
+                <item android:offset="1.0" android:color="#FFC084FC" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Inner Bright Core Facet of Knowledge Prism -->
+    <path
+        android:fillColor="#B3FFFFFF"
+        android:pathData="M54,37.4 L57.4,42.2 L54,45.2 L50.6,42.2 Z" />
+
+    <!-- Orbiting Photon Satellites -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M29.5,39.5 A2.0,2.0 0 1,1 29.49,39.5 Z" />
+    <path
+        android:fillColor="#FF00E5FF"
+        android:pathData="M78.5,39.5 A1.8,1.8 0 1,1 78.49,39.5 Z" />
 </vector>

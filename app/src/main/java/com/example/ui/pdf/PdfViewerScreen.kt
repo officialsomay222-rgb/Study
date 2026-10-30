@@ -11,10 +11,15 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.LinearOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -24,6 +29,7 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -36,6 +42,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -45,6 +52,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -52,7 +60,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
@@ -120,15 +130,34 @@ fun PdfViewerScreen(
     val notchGap = with(LocalDensity.current) { 3.toDp() }
     val topBarNotchSafePadding = safeCutout + notchGap
 
-    // Fullscreen Immersive Mode: Strictly hide phone navigation bar & status bar while PDF opener is open
-    // Automatically restores phone buttons & status bar on exit
+    // True Game Mode Immersive Fullscreen:
+    // Content renders 100% edge-to-edge across the entire screen including cutout/navigation areas.
+    // Swiping from bottom, top, or sides transiently overlays system bars while PDF content remains visible underneath.
     DisposableEffect(activity) {
         val window = activity?.window
         val insetsController = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
 
-        if (window != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            window.isNavigationBarContrastEnforced = false
-            window.isStatusBarContrastEnforced = false
+        if (window != null) {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            @Suppress("DEPRECATION")
+            window.statusBarColor = android.graphics.Color.TRANSPARENT
+            @Suppress("DEPRECATION")
+            window.navigationBarColor = android.graphics.Color.TRANSPARENT
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                window.navigationBarDividerColor = android.graphics.Color.TRANSPARENT
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode =
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                            android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                        } else {
+                            android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                        }
+                }
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+                window.isStatusBarContrastEnforced = false
+            }
         }
         insetsController?.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -142,11 +171,15 @@ fun PdfViewerScreen(
     var isVisible by remember { mutableStateOf(false) }
     var isClosing by remember { mutableStateOf(false) }
 
-    // Keep system bars hidden across any recomposition while PDF viewer is active
+    // Keep Game Mode system bars hidden across any recomposition while PDF viewer is active
     SideEffect {
         if (!isClosing) {
             val window = activity?.window
             if (window != null) {
+                @Suppress("DEPRECATION")
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                @Suppress("DEPRECATION")
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
                 val insetsController = WindowCompat.getInsetsController(window, window.decorView)
                 insetsController.systemBarsBehavior =
                     WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -204,7 +237,8 @@ fun PdfViewerScreen(
     }
 
     // Immediately hide ball when scrolling starts; only reveal ball when scrolling stops AND last scroll was upward
-    LaunchedEffect(isUserScrolling) {
+    LaunchedEffect(isUserScrolling, renderEngine) {
+        renderEngine?.isUserActivelyScrolling = isUserScrolling
         if (isUserScrolling) {
             if (barsVisible && !isOrbMenuOpen) {
                 barsVisible = false
@@ -224,15 +258,30 @@ fun PdfViewerScreen(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var lastTapTime by remember { mutableLongStateOf(0L) }
 
+    // Derived thresholds prevent per-frame pinch-to-zoom recomposition of page items
+    val isHighZoomMode by remember { derivedStateOf { zoomScale >= 1.55f } }
+    val isNativeScrollEnabled by remember { derivedStateOf { zoomScale <= 1.05f } }
+    val itemWidthFraction by remember {
+        derivedStateOf {
+            if (zoomScale < 0.995f) zoomScale.coerceIn(0.75f, 1f) else 1f
+        }
+    }
+
     var zoomAnimJob by remember { mutableStateOf<Job?>(null) }
     var flingJob by remember { mutableStateOf<Job?>(null) }
 
     fun applyFlowVerticalDelta(screenDeltaY: Float, currentZoom: Float, viewHeight: Float) {
         if (screenDeltaY == 0f) return
         val safeZoom = currentZoom.coerceAtLeast(0.5f)
+        if (safeZoom <= 1.02f) {
+            panOffsetY = 0f
+            listState.dispatchRawDelta(-screenDeltaY)
+            return
+        }
         val maxPanY = max(0f, (viewHeight * (safeZoom - 1f)) / 2f)
         var remainingScreenY = screenDeltaY
 
+        // 1. First consume any existing boundary panOffsetY back toward 0f before scrolling the list
         if (panOffsetY > 0f && remainingScreenY < 0f) {
             val consumePan = max(remainingScreenY, -panOffsetY)
             panOffsetY += consumePan
@@ -243,14 +292,18 @@ fun PdfViewerScreen(
             remainingScreenY -= consumePan
         }
 
+        // 2. Scroll the underlying LazyColumn in 1:1 screen space
         if (abs(remainingScreenY) > 0.01f) {
             val listDelta = -remainingScreenY / safeZoom
             val consumedList = listState.dispatchRawDelta(listDelta)
             val unconsumedScreenY = remainingScreenY + consumedList * safeZoom
-            panOffsetY = (panOffsetY + unconsumedScreenY).coerceIn(-maxPanY, maxPanY)
-        } else {
-            panOffsetY = panOffsetY.coerceIn(-maxPanY, maxPanY)
+            panOffsetY += unconsumedScreenY
         }
+
+        // 3. Strictly clamp panOffsetY so it can ONLY be non-zero at the true top of Page 1 or true bottom of the last page
+        val minPanBound = if (!listState.canScrollForward) -maxPanY else 0f
+        val maxPanBound = if (!listState.canScrollBackward) maxPanY else 0f
+        panOffsetY = panOffsetY.coerceIn(minPanBound, maxPanBound)
     }
 
     fun animateZoomAndPan(
@@ -274,7 +327,10 @@ fun PdfViewerScreen(
                 zoomScale = newZoom
                 panOffsetX = startPanX + (targetPanX - startPanX) * progress
 
-                if (viewMode == PdfViewMode.CONTINUOUS_FLOW && focusScreenY != null && abs(stepRatio - 1f) > 0.0001f) {
+                if (newZoom <= 1.0f && viewMode == PdfViewMode.CONTINUOUS_FLOW) {
+                    panOffsetX = 0f
+                    panOffsetY = 0f
+                } else if (viewMode == PdfViewMode.CONTINUOUS_FLOW && focusScreenY != null && abs(stepRatio - 1f) > 0.0001f) {
                     val focusY = focusScreenY - centerY
                     val focalShiftY = (focusY - panOffsetY) * (1f - stepRatio)
                     applyFlowVerticalDelta(focalShiftY, newZoom, ch)
@@ -533,29 +589,7 @@ fun PdfViewerScreen(
             .background(readerBackgroundColor)
             .nestedScroll(nestedScrollConnection)
     ) {
-        // Subtle ambient atmospheric background mesh
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .drawBehind {
-                    drawCircle(
-                        brush = Brush.radialGradient(
-                            listOf(Color(0xFF00E5FF).copy(alpha = 0.06f), Color.Transparent),
-                            center = Offset(size.width * 0.8f, size.height * 0.2f),
-                            radius = size.width * 0.7f
-                        )
-                    )
-                    drawCircle(
-                        brush = Brush.radialGradient(
-                            listOf(Color(0xFF7C4DFF).copy(alpha = 0.05f), Color.Transparent),
-                            center = Offset(size.width * 0.2f, size.height * 0.85f),
-                            radius = size.width * 0.8f
-                        )
-                    )
-                }
-        )
-
-        // MAIN CONTENT AREA: SWIPEABLE PAGES WITH COMPRESSED GRAPHICS
+        // MAIN CONTENT AREA: SWIPEABLE PAGES WITH GPU-PREPPED GRAPHICS
         if (pageCount > 0 && renderEngine != null) {
             val engine = renderEngine!!
 
@@ -616,10 +650,17 @@ fun PdfViewerScreen(
 
                                         zoomScale = targetZoom
                                         val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
-                                        panOffsetX = (panOffsetX + focalShiftX + panDelta.x).coerceIn(-maxPanX, maxPanX)
+                                        panOffsetX = if (zoomScale <= 1.0f) 0f else (panOffsetX + focalShiftX + panDelta.x).coerceIn(-maxPanX, maxPanX)
 
                                         if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
-                                            applyFlowVerticalDelta(focalShiftY + panDelta.y, zoomScale, ch)
+                                            if (zoomScale <= 1.0f) {
+                                                panOffsetY = 0f
+                                                if (panDelta.y != 0f) {
+                                                    listState.dispatchRawDelta(-panDelta.y)
+                                                }
+                                            } else {
+                                                applyFlowVerticalDelta(focalShiftY + panDelta.y, zoomScale, ch)
+                                            }
                                         } else {
                                             val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
                                             panOffsetY = (panOffsetY + focalShiftY + panDelta.y).coerceIn(-maxPanY, maxPanY)
@@ -697,14 +738,21 @@ fun PdfViewerScreen(
                             // Fling inertia on release in zoomed Flow mode (cancellable on next touch down)
                             if (viewMode == PdfViewMode.CONTINUOUS_FLOW && zoomScale > 1.05f && hasMoved && !isMultiTouch) {
                                 val velocity = velocityTracker.calculateVelocity()
-                                if (abs(velocity.y) > 110f) {
-                                    val safeZoom = zoomScale.coerceAtLeast(1f)
+                                if (abs(velocity.y) > 95f) {
+                                    val totalScreenFlingY = (velocity.y * 0.28f).coerceIn(-ch * 2.4f, ch * 2.4f)
+                                    val durationMs = (240 + (abs(velocity.y) / 18f).toInt()).coerceIn(240, 520)
                                     flingJob = coroutineScope.launch {
                                         try {
-                                            listState.animateScrollBy(
-                                                (-velocity.y * 0.22f) / safeZoom,
-                                                tween(280, easing = FastOutSlowInEasing)
-                                            )
+                                            var prevVal = 0f
+                                            animate(
+                                                initialValue = 0f,
+                                                targetValue = totalScreenFlingY,
+                                                animationSpec = tween(durationMs, easing = LinearOutSlowInEasing)
+                                            ) { currentVal, _ ->
+                                                val stepDelta = currentVal - prevVal
+                                                prevVal = currentVal
+                                                applyFlowVerticalDelta(stepDelta, zoomScale, ch)
+                                            }
                                         } catch (_: Exception) {
                                         } finally {
                                             isZoomGestureScrolling = false
@@ -720,6 +768,8 @@ fun PdfViewerScreen(
                             // Snap-back bounds checking on finger release
                             val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
                             val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
+                            val minAllowedPanY = if (viewMode == PdfViewMode.CONTINUOUS_FLOW && listState.canScrollForward) 0f else -maxPanY
+                            val maxAllowedPanY = if (viewMode == PdfViewMode.CONTINUOUS_FLOW && listState.canScrollBackward) 0f else maxPanY
 
                             if (zoomScale < 0.75f) {
                                 // Snap back to minimum zoom if pinched out too far
@@ -728,11 +778,11 @@ fun PdfViewerScreen(
                                 animateZoomAndPan(
                                     5.0f,
                                     panOffsetX.coerceIn(-maxPanX, maxPanX),
-                                    panOffsetY.coerceIn(-maxPanY, maxPanY)
+                                    panOffsetY.coerceIn(minAllowedPanY, maxAllowedPanY)
                                 )
                             } else if (zoomScale > 1.05f) {
                                 val clampedX = panOffsetX.coerceIn(-maxPanX, maxPanX)
-                                val clampedY = panOffsetY.coerceIn(-maxPanY, maxPanY)
+                                val clampedY = panOffsetY.coerceIn(minAllowedPanY, maxAllowedPanY)
                                 if (clampedX != panOffsetX || clampedY != panOffsetY) {
                                     animateZoomAndPan(zoomScale, clampedX, clampedY)
                                 }
@@ -740,6 +790,12 @@ fun PdfViewerScreen(
                                 // In zoomed out mode (0.75f..0.98f): preserve zoomed out view, keep centered
                                 if (panOffsetX != 0f || panOffsetY != 0f) {
                                     animateZoomAndPan(zoomScale, 0f, 0f)
+                                }
+                            } else {
+                                // Around 1.0x zoom: keep pan offsets strictly 0f
+                                if (panOffsetX != 0f || panOffsetY != 0f) {
+                                    panOffsetX = 0f
+                                    panOffsetY = 0f
                                 }
                             }
 
@@ -788,7 +844,7 @@ fun PdfViewerScreen(
                     }
             ) {
                 if (viewMode == PdfViewMode.PAGE_SWIPE) {
-                    // HORIZONTAL SWIPE PAGER WITH BEYOND-VIEWPORT PREFETCHING
+                    // HORIZONTAL SWIPE PAGER WITH EDGE-TO-EDGE GAME MODE VIEW
                     HorizontalPager(
                         state = pagerState,
                         beyondViewportPageCount = 1,
@@ -800,44 +856,40 @@ fun PdfViewerScreen(
                                 translationX = panOffsetX
                                 translationY = panOffsetY
                             },
-                        pageSpacing = 16.dp,
-                        userScrollEnabled = zoomScale <= 1.05f
+                        pageSpacing = 10.dp,
+                        userScrollEnabled = isNativeScrollEnabled
                     ) { pageIdx ->
                         PdfSinglePageView(
                             pageIndex = pageIdx,
                             engine = engine,
                             colorFilter = paperColorFilter,
                             isSwipeMode = true,
-                            isHighZoom = zoomScale >= 1.55f && abs(pageIdx - currentPageIndex) <= 1,
+                            isHighZoom = isHighZoomMode,
                             isUserScrolling = isUserScrolling,
                             modifier = Modifier
                                 .fillMaxSize()
-                                .padding(
-                                    top = if (barsVisible) topBarNotchSafePadding + 46.dp else safeCutout,
-                                    bottom = if (barsVisible) 68.dp else 16.dp,
-                                    start = 8.dp,
-                                    end = 8.dp
-                                )
+                                .padding(horizontal = 2.dp)
                         )
                     }
                 } else {
-                    // CONTINUOUS VERTICAL FLOW: Pure GPU graphicsLayer scaling (zero layout pass during pinch-to-zoom!)
+                    // CONTINUOUS VERTICAL FLOW:
+                    // When zoomScale < 1f (e.g. 0.75x), LazyColumn stays 100% full-screen height so there is ZERO
+                    // top or bottom viewport gap when scrolling upside/downside, while each page scales to zoomScale width & height.
                     LazyColumn(
                         state = listState,
-                        userScrollEnabled = zoomScale <= 1.05f,
+                        userScrollEnabled = isNativeScrollEnabled,
+                        horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier
                             .fillMaxSize()
                             .graphicsLayer {
-                                scaleX = zoomScale
-                                scaleY = zoomScale
-                                translationX = panOffsetX
-                                translationY = panOffsetY
+                                val flowLayerScale = zoomScale.coerceAtLeast(1f)
+                                scaleX = flowLayerScale
+                                scaleY = flowLayerScale
+                                translationX = if (zoomScale > 1f) panOffsetX else 0f
+                                translationY = if (zoomScale > 1f) panOffsetY else 0f
                             },
-                        contentPadding = PaddingValues(
-                            top = if (barsVisible) topBarNotchSafePadding + 48.dp else safeCutout,
-                            bottom = 40.dp
-                        ),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                        contentPadding = PaddingValues(vertical = 0.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         items(
                             count = pageCount,
@@ -848,11 +900,11 @@ fun PdfViewerScreen(
                                 engine = engine,
                                 colorFilter = paperColorFilter,
                                 isSwipeMode = false,
-                                isHighZoom = zoomScale >= 1.55f && abs(pageIdx - currentPageIndex) <= 1,
+                                isHighZoom = isHighZoomMode,
                                 isUserScrolling = isUserScrolling,
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 10.dp)
+                                    .fillMaxWidth(itemWidthFraction)
+                                    .padding(horizontal = 2.dp)
                             )
                         }
                     }
@@ -860,60 +912,198 @@ fun PdfViewerScreen(
             }
         }
 
-        // LOADING OVERLAY
+        // PREMIUM REALISTIC AURA LOADING OVERLAY
         if (isDownloading) {
+            val pdfLoadTransition = rememberInfiniteTransition(label = "PdfAuraLoad")
+            val orbitAngle by pdfLoadTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 360f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(3600, easing = LinearEasing),
+                    repeatMode = RepeatMode.Restart
+                ),
+                label = "PdfOrbit"
+            )
+            val auraBreath by pdfLoadTransition.animateFloat(
+                initialValue = 0.88f,
+                targetValue = 1.12f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(2200, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = "PdfAuraBreath"
+            )
+            val effectiveProgress = if (downloadProgress > 0.02f) downloadProgress.coerceIn(0f, 1f) else 0.38f
+
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color(0xE6080B14)),
+                    .background(Color(0xF204070E)),
                 contentAlignment = Alignment.Center
             ) {
+                // Background Ambient Aura Bloom
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val baseR = minOf(size.width, size.height) * 0.45f * auraBreath
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                Color(0xFF00E5FF).copy(alpha = 0.16f),
+                                Color(0xFF6366F1).copy(alpha = 0.09f),
+                                Color.Transparent
+                            ),
+                            center = Offset(cx, cy),
+                            radius = baseR.coerceAtLeast(10f)
+                        ),
+                        center = Offset(cx, cy),
+                        radius = baseR.coerceAtLeast(10f)
+                    )
+                }
+
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier
-                        .padding(32.dp)
+                        .padding(28.dp)
+                        .widthIn(min = 280.dp, max = 360.dp)
                         .background(
                             Brush.verticalGradient(
                                 listOf(
-                                    Color(0xFF1E263E).copy(alpha = 0.88f),
-                                    Color(0xFF0F1528).copy(alpha = 0.96f)
+                                    Color(0xFF162038).copy(alpha = 0.92f),
+                                    Color(0xFF0A0F1D).copy(alpha = 0.97f)
                                 )
                             ),
-                            RoundedCornerShape(26.dp)
+                            RoundedCornerShape(30.dp)
                         )
                         .border(
-                            BorderStroke(1.2.dp, Brush.linearGradient(listOf(Color.White.copy(0.4f), Color(0xFF00E5FF).copy(0.3f)))),
-                            RoundedCornerShape(26.dp)
+                            BorderStroke(
+                                1.2.dp,
+                                Brush.linearGradient(
+                                    listOf(
+                                        Color.White.copy(alpha = 0.38f),
+                                        Color(0xFF38BDF8).copy(alpha = 0.32f),
+                                        Color(0xFF818CF8).copy(alpha = 0.16f)
+                                    )
+                                )
+                            ),
+                            RoundedCornerShape(30.dp)
                         )
-                        .padding(horizontal = 32.dp, vertical = 28.dp)
+                        .padding(horizontal = 28.dp, vertical = 28.dp)
                 ) {
-                    CircularProgressIndicator(
-                        progress = { if (downloadProgress > 0) downloadProgress else 0.5f },
-                        color = Color(0xFF00E5FF),
-                        strokeWidth = 3.5.dp,
-                        modifier = Modifier.size(54.dp)
-                    )
+                    // 3D Glass Medallion with Orbital Aura Ring
+                    Box(
+                        modifier = Modifier.size(86.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val r = size.minDimension / 2f
+                            // Subtle outer track
+                            drawCircle(
+                                color = Color.White.copy(alpha = 0.08f),
+                                radius = r - 4.dp.toPx(),
+                                style = Stroke(width = 2.dp.toPx())
+                            )
+                            // Rotating dual-arc aura ring
+                            drawArc(
+                                brush = Brush.sweepGradient(
+                                    listOf(
+                                        Color.Transparent,
+                                        Color(0xFF38BDF8),
+                                        Color(0xFFA855F7),
+                                        Color.Transparent
+                                    )
+                                ),
+                                startAngle = orbitAngle,
+                                sweepAngle = 220f,
+                                useCenter = false,
+                                style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(62.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    Brush.radialGradient(
+                                        listOf(
+                                            Color(0xFF1E293B),
+                                            Color(0xFF090D16)
+                                        )
+                                    )
+                                )
+                                .border(
+                                    1.dp,
+                                    Brush.linearGradient(
+                                        listOf(
+                                            Color.White.copy(alpha = 0.42f),
+                                            Color(0xFF38BDF8).copy(alpha = 0.2f)
+                                        )
+                                    ),
+                                    CircleShape
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Description,
+                                contentDescription = null,
+                                tint = Color(0xFF38BDF8),
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(18.dp))
+
                     Text(
-                        text = "Opening Study Document...",
-                        color = Color.White,
-                        fontSize = 17.sp,
+                        text = "Preparing High-Clarity Document",
+                        color = Color(0xFFF8FAFC),
+                        fontSize = 16.sp,
                         fontWeight = FontWeight.Bold
                     )
+
                     Spacer(modifier = Modifier.height(6.dp))
+
                     Text(
                         text = resolvedTitle,
-                        color = Color(0xFF90CAF9),
-                        fontSize = 13.sp,
+                        color = Color(0xFF94A3B8),
+                        fontSize = 12.5.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Realistic Progress Track & Percentage
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(CircleShape)
+                            .background(Color.White.copy(alpha = 0.08f))
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(effectiveProgress)
+                                .fillMaxHeight()
+                                .clip(CircleShape)
+                                .background(
+                                    Brush.horizontalGradient(
+                                        listOf(
+                                            Color(0xFF38BDF8),
+                                            Color(0xFF818CF8),
+                                            Color(0xFFC084FC)
+                                        )
+                                    )
+                                )
+                        )
+                    }
+
                     if (downloadProgress > 0f) {
-                        Spacer(modifier = Modifier.height(10.dp))
+                        Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "${(downloadProgress * 100).toInt()}%",
-                            color = Color(0xFF00E5FF),
-                            fontSize = 14.sp,
+                            text = "${(downloadProgress * 100).toInt()}% Synchronized",
+                            color = Color(0xFF38BDF8),
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold
                         )
                     }

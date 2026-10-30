@@ -459,8 +459,22 @@ object FileImportHelper {
      * Converts an image file (PNG/JPEG/WEBP) into a high-resolution single-page PDF.
      */
     private fun convertImageToPdf(context: Context, imageFile: File): File? {
+        var bmp: android.graphics.Bitmap? = null
+        var pdfDoc: PdfDocument? = null
         return try {
-            val bmp = BitmapFactory.decodeFile(imageFile.absolutePath) ?: return null
+            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(imageFile.absolutePath, boundsOpts)
+            if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) return null
+
+            var sampleSize = 1
+            while (boundsOpts.outWidth / sampleSize > 2048 || boundsOpts.outHeight / sampleSize > 2048) {
+                sampleSize *= 2
+            }
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+            }
+            bmp = BitmapFactory.decodeFile(imageFile.absolutePath, decodeOpts) ?: return null
             val cacheFolder = File(context.cacheDir, "study_pdfs").apply { mkdirs() }
             val outPdf = File(cacheFolder, "img_${System.currentTimeMillis()}.pdf")
 
@@ -468,7 +482,7 @@ object FileImportHelper {
             val aspect = bmp.height.toFloat() / bmp.width.toFloat().coerceAtLeast(1f)
             val pageHeight = (pageWidth * aspect).toInt().coerceIn(720, 2400)
 
-            val pdfDoc = PdfDocument()
+            pdfDoc = PdfDocument()
             val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, 1).create()
             val page = pdfDoc.startPage(pageInfo)
             val canvas: Canvas = page.canvas
@@ -480,12 +494,13 @@ object FileImportHelper {
 
             pdfDoc.finishPage(page)
             FileOutputStream(outPdf).use { pdfDoc.writeTo(it) }
-            pdfDoc.close()
-            bmp.recycle()
             if (outPdf.exists() && outPdf.length() > 0) outPdf else null
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (t: Throwable) {
+            t.printStackTrace()
             null
+        } finally {
+            try { pdfDoc?.close() } catch (_: Throwable) {}
+            try { bmp?.recycle() } catch (_: Throwable) {}
         }
     }
 

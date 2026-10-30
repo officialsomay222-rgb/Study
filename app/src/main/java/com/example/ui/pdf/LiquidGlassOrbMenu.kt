@@ -154,29 +154,15 @@ fun LiquidGlassOrbMenuCard(
                         }
                     }
 
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(horizontal = 10.dp)
-                    ) {
-                        Text(
-                            text = resolvedTitle,
-                            color = Color(0xFFF1F5F9),
-                            fontSize = 12.5.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = if (zoomScale >= 1.55f) "$zoomPercent% · Ultra-HD Clarity"
-                            else "$zoomPercent% · ${if (viewMode == PdfViewMode.CONTINUOUS_FLOW) "Flow View" else "Swipe View"}",
-                            color = if (zoomScale >= 1.55f) Color(0xFF34D399) else Color(0xFF94A3B8),
-                            fontSize = 10.5.sp,
-                            fontWeight = FontWeight.Medium,
-                            maxLines = 1
-                        )
-                    }
+                    Text(
+                        text = if (zoomScale >= 1.55f) "$zoomPercent% · Ultra-HD"
+                        else "$zoomPercent% · ${if (viewMode == PdfViewMode.CONTINUOUS_FLOW) "Flow Mode" else "Swipe Mode"}",
+                        color = if (zoomScale >= 1.55f) Color(0xFF34D399) else Color(0xFF94A3B8),
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
 
                     Surface(
                         onClick = onClose,

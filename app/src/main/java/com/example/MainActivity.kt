@@ -162,30 +162,43 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         if (intent == null) return
-        val uri = FileImportHelper.extractUriFromIntent(intent) ?: return
-
-        // Take persistable permission if available
         try {
-            val takeFlags = intent.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            if (takeFlags != 0) {
-                contentResolver.takePersistableUriPermission(uri, takeFlags)
-            }
-        } catch (e: Exception) {
-            // Non-persistable URIs will throw, safe to ignore
-        }
+            val uri = FileImportHelper.extractUriFromIntent(intent) ?: return
 
-        incomingPdfUri = uri
-        incomingPdfName = FileImportHelper.resolveDisplayName(this, uri)
+            // Take persistable permission if available
+            try {
+                val takeFlags = intent.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                if (takeFlags != 0) {
+                    contentResolver.takePersistableUriPermission(uri, takeFlags)
+                }
+            } catch (_: Throwable) {
+                // Non-persistable URIs will throw, safe to ignore
+            }
+
+            incomingPdfUri = uri
+            incomingPdfName = FileImportHelper.resolveDisplayName(this, uri)
+        } catch (t: Throwable) {
+            t.printStackTrace()
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        webViewInstance?.saveState(outState)
+        try {
+            webViewInstance?.saveState(outState)
+        } catch (_: Throwable) {}
     }
 
     override fun onRestoreInstanceState(savedInstanceState: Bundle) {
         super.onRestoreInstanceState(savedInstanceState)
-        webViewInstance?.restoreState(savedInstanceState)
+        try {
+            webViewInstance?.restoreState(savedInstanceState)
+        } catch (_: Throwable) {}
+    }
+
+    override fun onDestroy() {
+        webViewInstance = null
+        super.onDestroy()
     }
 }
 
@@ -193,14 +206,15 @@ fun setupStudyVerseMediaSession(context: Context): MediaSession? {
     return try {
         val bitmap = BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher)
         MediaSession(context, "StudyVerseMedia").apply {
-            val metadata = MediaMetadata.Builder()
+            val metadataBuilder = MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, "StudyVerse")
                 .putString(MediaMetadata.METADATA_KEY_ARTIST, "StudyVerse Learning Platform")
                 .putString(MediaMetadata.METADATA_KEY_ALBUM, "StudyVerse Audio")
-                .putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bitmap)
-                .putBitmap(MediaMetadata.METADATA_KEY_ART, bitmap)
-                .build()
-            setMetadata(metadata)
+            if (bitmap != null) {
+                metadataBuilder.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, bitmap)
+                metadataBuilder.putBitmap(MediaMetadata.METADATA_KEY_ART, bitmap)
+            }
+            setMetadata(metadataBuilder.build())
             setPlaybackState(
                 PlaybackState.Builder()
                     .setActions(
@@ -213,8 +227,8 @@ fun setupStudyVerseMediaSession(context: Context): MediaSession? {
             )
             isActive = true
         }
-    } catch (e: Exception) {
-        e.printStackTrace()
+    } catch (t: Throwable) {
+        t.printStackTrace()
         null
     }
 }
@@ -266,6 +280,7 @@ class WebScrollGuardState {
     @Volatile var isTouchActive: Boolean = false
     @Volatile var lastScrollWasUp: Boolean = false
     @Volatile var lastScrollEventTime: Long = 0L
+    @Volatile var settleCallbackScheduled: Boolean = false
 }
 
 @Composable
@@ -275,7 +290,7 @@ fun WebViewScreen(
     initialPdfUri: Uri? = null,
     initialPdfTitle: String? = null,
     onClearIncomingPdf: () -> Unit = {},
-    onWebViewCreated: (WebView) -> Unit = {}
+    onWebViewCreated: (WebView?) -> Unit = {}
 ) {
     val context = LocalContext.current
     val studyPrefs = remember { context.getSharedPreferences("StudyVersePrefs", Context.MODE_PRIVATE) }
@@ -319,6 +334,19 @@ fun WebViewScreen(
     // Inbuilt PDF Opener State
     var activePdfSource by remember { mutableStateOf<String?>(null) }
     var activePdfTitle by remember { mutableStateOf<String?>(null) }
+
+    // On-Demand Power Management: Pause WebView DOM/rendering while PDF Reader is open so it uses 0% power
+    LaunchedEffect(activePdfSource != null, webView) {
+        val wv = webView ?: return@LaunchedEffect
+        try {
+            if (activePdfSource != null) {
+                wv.onPause()
+            } else {
+                wv.onResume()
+            }
+        } catch (_: Throwable) {
+        }
+    }
 
     // Handle incoming PDF from external apps / file manager / downloads
     LaunchedEffect(initialPdfUri) {
@@ -544,7 +572,7 @@ fun WebViewScreen(
                     windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
                 }
                 @Suppress("DEPRECATION")
-                if (isInitialLink) {
+                if (isInitialLink || activePdfSource != null || customView != null) {
                     window.statusBarColor = android.graphics.Color.TRANSPARENT
                     window.navigationBarColor = android.graphics.Color.TRANSPARENT
                 } else {
@@ -695,10 +723,12 @@ fun WebViewScreen(
                         // finger leaves the screen AND upward scrolling has completely stopped.
                         val showBallWhenSettledRunnable = object : Runnable {
                             override fun run() {
+                                scrollGuard.settleCallbackScheduled = false
                                 if (scrollGuard.isFirstSite || scrollGuard.isTouchActive) return
-                                val elapsed = System.currentTimeMillis() - scrollGuard.lastScrollEventTime
+                                val elapsed = android.os.SystemClock.uptimeMillis() - scrollGuard.lastScrollEventTime
                                 if (elapsed < 135L) {
-                                    postDelayed(this, 145L - elapsed)
+                                    scrollGuard.settleCallbackScheduled = true
+                                    postDelayed(this, (145L - elapsed).coerceAtLeast(35L))
                                     return
                                 }
                                 if (scrollGuard.lastScrollWasUp && !isWebBallVisible) {
@@ -771,16 +801,17 @@ fun WebViewScreen(
                             onScrollDirectionChanged = { scrollingDown ->
                                 if (!scrollGuard.isFirstSite) {
                                     scrollGuard.lastScrollWasUp = !scrollingDown
-                                    scrollGuard.lastScrollEventTime = System.currentTimeMillis()
-                                    post {
-                                        // Immediately hide ball while scrolling in ANY direction (up or down)
-                                        if (!isWebOrbMenuOpen && isWebBallVisible) {
-                                            isWebBallVisible = false
+                                    scrollGuard.lastScrollEventTime = android.os.SystemClock.uptimeMillis()
+                                    if (!isWebOrbMenuOpen && isWebBallVisible) {
+                                        post {
+                                            if (!isWebOrbMenuOpen && isWebBallVisible) {
+                                                isWebBallVisible = false
+                                            }
                                         }
-                                        removeCallbacks(showBallWhenSettledRunnable)
-                                        if (!scrollGuard.isTouchActive && scrollGuard.lastScrollWasUp) {
-                                            postDelayed(showBallWhenSettledRunnable, 160L)
-                                        }
+                                    }
+                                    if (!scrollGuard.isTouchActive && scrollGuard.lastScrollWasUp && !scrollGuard.settleCallbackScheduled) {
+                                        scrollGuard.settleCallbackScheduled = true
+                                        postDelayed(showBallWhenSettledRunnable, 150L)
                                     }
                                 }
                             }
@@ -793,14 +824,17 @@ fun WebViewScreen(
                             android.view.ViewGroup.LayoutParams.MATCH_PARENT
                         )
                         
-                        // Native hardware-accelerated direct rendering (avoids offscreen buffer MESA issues)
+                        // Native hardware-accelerated direct rendering & on-demand renderer priority
                         setLayerType(View.LAYER_TYPE_NONE, null)
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                            setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true)
+                        }
                         overScrollMode = View.OVER_SCROLL_NEVER
                         isVerticalScrollBarEnabled = false
                         isHorizontalScrollBarEnabled = false
 
-                        // Native WebView scroll listener:
-                        // Immediately hides ball on ANY scroll (up or down) and schedules settle check if upward
+                        // Zero-allocation Native WebView scroll listener:
+                        // Updates primitive timestamps & hides ball at most ONCE when scroll starts (no handler churn)
                         setOnScrollChangeListener { _, _, scrollY, _, oldScrollY ->
                             if (scrollY > 0) {
                                 scrollGuard.isWebPageScrolledDown = true
@@ -811,34 +845,33 @@ fun WebViewScreen(
                             if (!scrollGuard.isFirstSite) {
                                 val dy = scrollY - oldScrollY
                                 if (kotlin.math.abs(dy) > 4) {
-                                    scrollGuard.lastScrollEventTime = System.currentTimeMillis()
-                                    if (dy > 4) {
-                                        scrollGuard.lastScrollWasUp = false
-                                    } else if (dy < -4) {
-                                        scrollGuard.lastScrollWasUp = true
-                                    }
+                                    scrollGuard.lastScrollEventTime = android.os.SystemClock.uptimeMillis()
+                                    scrollGuard.lastScrollWasUp = dy < -4
                                     if (!isWebOrbMenuOpen && isWebBallVisible) {
                                         isWebBallVisible = false
                                     }
-                                    removeCallbacks(showBallWhenSettledRunnable)
-                                    if (!scrollGuard.isTouchActive && scrollGuard.lastScrollWasUp) {
-                                        postDelayed(showBallWhenSettledRunnable, 160L)
+                                    if (!scrollGuard.isTouchActive && scrollGuard.lastScrollWasUp && !scrollGuard.settleCallbackScheduled) {
+                                        scrollGuard.settleCallbackScheduled = true
+                                        postDelayed(showBallWhenSettledRunnable, 150L)
                                     }
                                 }
                             }
                         }
 
-                        // Touch listener:
+                        // Zero-allocation Touch listener:
                         // 1. Locks touchStartedAtTop on ACTION_DOWN so upward scroll never triggers refresh mid-swipe
-                        // 2. Immediately hides floating ball on ANY scroll drag (up or down)
-                        // 3. Only shows floating ball after finger leaves screen (ACTION_UP/CANCEL) AND last scroll was upward
+                        // 2. Immediately hides floating ball ONCE on scroll drag start (up or down)
+                        // 3. Schedules settle check ONCE on ACTION_UP/CANCEL if last scroll was upward
                         var lastTouchY = 0f
                         setOnTouchListener { v, event ->
                             when (event.actionMasked) {
                                 android.view.MotionEvent.ACTION_DOWN -> {
                                     lastTouchY = event.y
                                     scrollGuard.isTouchActive = true
-                                    removeCallbacks(showBallWhenSettledRunnable)
+                                    if (scrollGuard.settleCallbackScheduled) {
+                                        scrollGuard.settleCallbackScheduled = false
+                                        removeCallbacks(showBallWhenSettledRunnable)
+                                    }
                                     val wv = v as? WebView
                                     val atTopNow = (wv == null || (wv.scrollY <= 0 && !wv.canScrollVertically(-1))) && !scrollGuard.isWebPageScrolledDown
                                     scrollGuard.touchStartedAtTop = atTopNow
@@ -848,18 +881,11 @@ fun WebViewScreen(
                                     if (!scrollGuard.isFirstSite) {
                                         val dy = event.y - lastTouchY
                                         if (kotlin.math.abs(dy) > 14f) {
-                                            scrollGuard.lastScrollEventTime = System.currentTimeMillis()
-                                            // Immediately hide ball when scrolling starts (whether scrolling up or down)
+                                            scrollGuard.lastScrollEventTime = android.os.SystemClock.uptimeMillis()
                                             if (!isWebOrbMenuOpen && isWebBallVisible) {
                                                 isWebBallVisible = false
                                             }
-                                            if (dy < -14f) {
-                                                // Finger dragging upward -> scrolling page down
-                                                scrollGuard.lastScrollWasUp = false
-                                            } else if (dy > 14f) {
-                                                // Finger dragging downward -> scrolling page up
-                                                scrollGuard.lastScrollWasUp = true
-                                            }
+                                            scrollGuard.lastScrollWasUp = dy > 14f
                                             lastTouchY = event.y
                                         }
                                     }
@@ -867,11 +893,9 @@ fun WebViewScreen(
                                 android.view.MotionEvent.ACTION_UP,
                                 android.view.MotionEvent.ACTION_CANCEL -> {
                                     scrollGuard.isTouchActive = false
-                                    if (!scrollGuard.isFirstSite) {
-                                        removeCallbacks(showBallWhenSettledRunnable)
-                                        if (scrollGuard.lastScrollWasUp) {
-                                            postDelayed(showBallWhenSettledRunnable, 160L)
-                                        }
+                                    if (!scrollGuard.isFirstSite && scrollGuard.lastScrollWasUp && !isWebBallVisible && !scrollGuard.settleCallbackScheduled) {
+                                        scrollGuard.settleCallbackScheduled = true
+                                        postDelayed(showBallWhenSettledRunnable, 150L)
                                     }
                                 }
                             }
@@ -957,24 +981,28 @@ fun WebViewScreen(
                                             }
                                         }
                                     } else {
+                                        val safeDownloadName = finalFileName
+                                            .replace("[^a-zA-Z0-9._ -]".toRegex(), "_")
+                                            .trim()
+                                            .ifBlank { "study_document.pdf" }
                                         val request = DownloadManager.Request(android.net.Uri.parse(downloadUrl)).apply {
                                             setMimeType(finalMimeType)
                                             addRequestHeader("User-Agent", userAgent)
                                             val cookie = CookieManager.getInstance().getCookie(downloadUrl)
                                             if (cookie != null) addRequestHeader("Cookie", cookie)
-                                            setTitle("StudyVerse: $finalFileName")
-                                            setDescription("Downloading $finalFileName...")
+                                            setTitle("StudyVerse: $safeDownloadName")
+                                            setDescription("Downloading $safeDownloadName...")
                                             setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, finalFileName)
+                                            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeDownloadName)
                                         }
                                         val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
                                         dm?.enqueue(request)
-                                        Toast.makeText(ctx, "StudyVerse: Downloading $finalFileName to Downloads...", Toast.LENGTH_LONG).show()
+                                        Toast.makeText(ctx, "StudyVerse: Downloading $safeDownloadName to Downloads...", Toast.LENGTH_LONG).show()
                                     }
                                 }
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                                Toast.makeText(ctx, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                            } catch (t: Throwable) {
+                                t.printStackTrace()
+                                Toast.makeText(ctx, "Download failed: ${t.message}", Toast.LENGTH_SHORT).show()
                             }
                         }
 
@@ -1430,10 +1458,26 @@ fun WebViewScreen(
                                         if (!window.__studyverse_scroll_guard_installed) {
                                             window.__studyverse_scroll_guard_installed = true;
                                             var lastReportedScrolled = null;
-                                            var lastScrollCheckTime = 0;
-                                            var scrolledTargets = [];
-                                            var lastScrollPosMap = new WeakMap();
-                                            var lastWinScroll = 0;
+                                            var settleTimer = null;
+                                            var activeScrollNode = null;
+
+                                            // On-Demand DOM Power Optimizer ("DOM-loading so power is used only when visible")
+                                            function enableOnDemandDomRendering() {
+                                                try {
+                                                    if (!document.getElementById('__sv_ondemand_css')) {
+                                                        var st = document.createElement('style');
+                                                        st.id = '__sv_ondemand_css';
+                                                        st.textContent = 'img, iframe { content-visibility: auto; }';
+                                                        if (document.head) document.head.appendChild(st);
+                                                    }
+                                                    var imgs = document.querySelectorAll('img:not([loading]), iframe:not([loading])');
+                                                    for (var i = 0; i < imgs.length; i++) {
+                                                        imgs[i].setAttribute('loading', 'lazy');
+                                                        if (imgs[i].tagName === 'IMG') imgs[i].setAttribute('decoding', 'async');
+                                                    }
+                                                } catch (e) {}
+                                            }
+                                            enableOnDemandDomRendering();
 
                                             function getWinScroll() {
                                                 return (window.pageYOffset || window.scrollY || (document.documentElement && document.documentElement.scrollTop) || (document.body && document.body.scrollTop) || 0);
@@ -1441,63 +1485,31 @@ fun WebViewScreen(
 
                                             function checkAnyScrolledFast(target) {
                                                 if (getWinScroll() > 1) return true;
-                                                var el = target;
+                                                var el = target || activeScrollNode;
                                                 while (el && el !== document && el !== window) {
                                                     if (el.scrollTop && el.scrollTop > 1) return true;
                                                     el = el.parentElement;
                                                 }
-                                                for (var i = scrolledTargets.length - 1; i >= 0; i--) {
-                                                    var node = scrolledTargets[i];
-                                                    if (!node || !node.isConnected) {
-                                                        scrolledTargets.splice(i, 1);
-                                                    } else if (node.scrollTop > 1) {
-                                                        return true;
-                                                    }
-                                                }
                                                 return false;
                                             }
 
+                                            // Zero-JNI during active scrolling: only report state once scrolling settles
                                             function onScrollCapture(e) {
-                                                var now = Date.now();
-                                                if (now - lastScrollCheckTime < 100) return;
-                                                lastScrollCheckTime = now;
-
                                                 var t = e ? e.target : null;
-                                                var isMainSite = window.location.hostname.indexOf('study-verse-lime.vercel.app') !== -1;
-
                                                 if (t && t !== document && t !== window && t.scrollTop !== undefined) {
-                                                    if (scrolledTargets.indexOf(t) === -1 && scrolledTargets.length < 12) {
-                                                        scrolledTargets.push(t);
-                                                    }
-                                                    if (!isMainSite) {
-                                                        var prev = lastScrollPosMap.get(t) || 0;
-                                                        var cur = t.scrollTop || 0;
-                                                        var dy = cur - prev;
-                                                        if (Math.abs(dy) > 6) {
-                                                            if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
-                                                                window.AndroidApp.reportScrollDirection(dy > 0);
-                                                            }
-                                                        }
-                                                        lastScrollPosMap.set(t, cur);
-                                                    }
-                                                } else if (!isMainSite) {
-                                                    var curWin = getWinScroll();
-                                                    var dyWin = curWin - lastWinScroll;
-                                                    if (Math.abs(dyWin) > 6) {
-                                                        if (window.AndroidApp && window.AndroidApp.reportScrollDirection) {
-                                                            window.AndroidApp.reportScrollDirection(dyWin > 0);
+                                                    activeScrollNode = t;
+                                                }
+                                                if (settleTimer) clearTimeout(settleTimer);
+                                                settleTimer = setTimeout(function() {
+                                                    var scrolled = checkAnyScrolledFast(activeScrollNode);
+                                                    if (scrolled !== lastReportedScrolled) {
+                                                        lastReportedScrolled = scrolled;
+                                                        if (window.AndroidApp && window.AndroidApp.reportScrollState) {
+                                                            window.AndroidApp.reportScrollState(scrolled);
                                                         }
                                                     }
-                                                    lastWinScroll = curWin;
-                                                }
-
-                                                var scrolled = checkAnyScrolledFast(t);
-                                                if (scrolled !== lastReportedScrolled) {
-                                                    lastReportedScrolled = scrolled;
-                                                    if (window.AndroidApp && window.AndroidApp.reportScrollState) {
-                                                        window.AndroidApp.reportScrollState(scrolled);
-                                                    }
-                                                }
+                                                    enableOnDemandDomRendering();
+                                                }, 180);
                                             }
 
                                             function onTouchStartCapture(e) {
@@ -1677,12 +1689,16 @@ fun WebViewScreen(
                     }
                 },
                 onRelease = { container ->
-                    val childWebView = container.getChildAt(0) as? WebView
-                    childWebView?.let {
-                        it.stopLoading()
-                        it.removeAllViews()
-                        it.destroy()
-                    }
+                    try {
+                        onWebViewCreated(null)
+                        webView = null
+                        val childWebView = container.getChildAt(0) as? WebView
+                        childWebView?.let {
+                            it.stopLoading()
+                            it.removeAllViews()
+                            it.destroy()
+                        }
+                    } catch (_: Throwable) {}
                 },
                 modifier = Modifier.fillMaxWidth().weight(1f)
             )
@@ -1803,15 +1819,7 @@ fun WebViewScreen(
                     .windowInsetsPadding(WindowInsets.navigationBars)
                     .padding(end = 16.dp, bottom = 84.dp, start = 16.dp)
             ) {
-                val activeHost = remember(currentLoadedUrl) {
-                    try {
-                        Uri.parse(currentLoadedUrl).host?.removePrefix("www.") ?: "Browser Controls"
-                    } catch (_: Exception) {
-                        "Browser Controls"
-                    }
-                }
                 WebFloatingBallChromeMenu(
-                    siteHost = activeHost,
                     canGoBack = canGoBack,
                     canGoForward = canGoForward,
                     swipeToRefreshEnabled = userSwipeToRefreshEnabled,
@@ -1945,436 +1953,903 @@ fun WebViewScreen(
 
 @Composable
 fun LoadingOverlay(progress: Float) {
-    val infiniteTransition = rememberInfiniteTransition(label = "ButterWaveDetailed")
-    
-    // Wave Phase Animations for butter fluidity
-    val phase1 by infiniteTransition.animateFloat(
+    val infiniteTransition = rememberInfiniteTransition(label = "RealisticAuraLoader")
+
+    // Smooth atmospheric aura & silk wave phase
+    val auraPhase by infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = (2 * PI).toFloat(),
         animationSpec = infiniteRepeatable(
-            animation = tween(3800, easing = LinearEasing),
+            animation = tween(4800, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "Phase1"
+        label = "AuraPhase"
     )
 
-    val phase2 by infiniteTransition.animateFloat(
+    // Secondary harmonic wave phase for layered volumetric curtains
+    val harmonicPhase by infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = (2 * PI).toFloat(),
         animationSpec = infiniteRepeatable(
-            animation = tween(5500, easing = LinearEasing),
+            animation = tween(6800, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "Phase2"
+        label = "HarmonicPhase"
     )
 
-    val phase3 by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = (2 * PI).toFloat(),
-        animationSpec = infiniteRepeatable(
-            animation = tween(7200, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "Phase3"
-    )
-
-    // Continuous Rotation for Glowing Shimmer Ring
-    val rotateAngle by infiniteTransition.animateFloat(
+    // Primary orbital rotation (clockwise)
+    val primaryOrbitAngle by infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 360f,
         animationSpec = infiniteRepeatable(
-            animation = tween(8000, easing = LinearEasing),
+            animation = tween(5400, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "RotateAngle"
+        label = "PrimaryOrbitAngle"
     )
 
-    // Breathing Pulse for the Main StudyVerse Emblem
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 0.95f,
-        targetValue = 1.05f,
+    // Secondary orbital rotation (counter-clockwise)
+    val counterOrbitAngle by infiniteTransition.animateFloat(
+        initialValue = 360f,
+        targetValue = 0f,
         animationSpec = infiniteRepeatable(
-            animation = tween(2000, easing = FastOutSlowInEasing),
+            animation = tween(4000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "CounterOrbitAngle"
+    )
+
+    // Subtle realistic breathing depth for core emblem & volumetric aura
+    val auraBreath by infiniteTransition.animateFloat(
+        initialValue = 0.94f,
+        targetValue = 1.07f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2100, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
         ),
-        label = "PulseScale"
+        label = "AuraBreath"
     )
 
-    // Radial Ripple Wave Cycle
-    val wavePulse by infiniteTransition.animateFloat(
+    // Expanding volumetric light horizon pulse (dual staggered shockwaves)
+    val horizonPulse by infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2600, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "HorizonPulse"
+    )
+
+    // Specular light sheen sweeping across glass surfaces
+    val shimmerSweep by infiniteTransition.animateFloat(
+        initialValue = -0.4f,
+        targetValue = 1.4f,
         animationSpec = infiniteRepeatable(
             animation = tween(2400, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Restart
         ),
-        label = "WavePulse"
+        label = "ShimmerSweep"
     )
 
-    // Floating particle drift offsets
-    val particleTime by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(6000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "ParticleTime"
-    )
+    // Smoothly interpolated progress value for realistic dial & bar motion
+    val clampedProgress = progress.coerceIn(0f, 1f)
+    val displayPercent = (clampedProgress * 100).toInt().coerceIn(8, 99)
+    val effectiveSweepProgress = clampedProgress.coerceIn(0.14f, 0.98f)
 
-    val topWave1 = remember { Path() }
-    val topWave2 = remember { Path() }
-    val bottomWave1 = remember { Path() }
-    val bottomWave2 = remember { Path() }
-    val energyLine1 = remember { Path() }
-    val energyLine2 = remember { Path() }
+    val statusStageText = remember(displayPercent) {
+        when {
+            displayPercent < 32 -> "Initializing Neural Study Core..."
+            displayPercent < 68 -> "Synchronizing Learning Workspace..."
+            else -> "Rendering Interactive Environment..."
+        }
+    }
+
+    val bookLeftPath = remember { Path() }
+    val bookRightPath = remember { Path() }
+    val prismPath = remember { Path() }
+    val topCurtainPath1 = remember { Path() }
+    val topCurtainPath2 = remember { Path() }
+    val bottomCurtainPath1 = remember { Path() }
+    val bottomCurtainPath2 = remember { Path() }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF080912)),
+            .background(Color(0xFF03050B)),
         contentAlignment = Alignment.Center
     ) {
-        // Detailed Multi-Layer Butter Wave Canvas
+        // 1. REALISTIC MULTI-LAYER VOLUMETRIC AURA & ATMOSPHERIC DEPTH CANVAS
         Canvas(modifier = Modifier.fillMaxSize()) {
             val width = size.width
             val height = size.height
+            val minDim = minOf(width, height)
             val maxDim = maxOf(width, height)
             val centerX = width / 2f
-            val centerY = height / 2f
+            val centerY = height * 0.43f
 
-            // 1. Full screen shifting gradient background
+            // Deep obsidian-midnight base gradient
             drawRect(
-                brush = Brush.linearGradient(
-                    colors = listOf(Color(0xFF06070D), Color(0xFF0F1322), Color(0xFF06070D)),
-                    start = Offset(0f, sin(phase1) * height),
-                    end = Offset(width, height - cos(phase2) * height)
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFF02040A),
+                        Color(0xFF080E20),
+                        Color(0xFF050814),
+                        Color(0xFF020308)
+                    )
                 )
             )
 
-            // 2. Massive animated ambient orbs for the full screen
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(Color(0xFF80DEEA).copy(alpha = 0.12f), Color.Transparent),
-                    center = Offset(width * 0.15f + sin(phase1) * 150f, height * 0.15f + cos(phase2) * 150f),
-                    radius = maxDim * 0.65f
-                ),
-                center = Offset(width * 0.15f + sin(phase1) * 150f, height * 0.15f + cos(phase2) * 150f),
-                radius = maxDim * 0.65f
-            )
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(Color(0xFFE040FB).copy(alpha = 0.08f), Color.Transparent),
-                    center = Offset(width * 0.85f - cos(phase3) * 150f, height * 0.85f - sin(phase1) * 150f),
-                    radius = maxDim * 0.65f
-                ),
-                center = Offset(width * 0.85f - cos(phase3) * 150f, height * 0.85f - sin(phase1) * 150f),
-                radius = maxDim * 0.65f
-            )
-
-            // 3. Expanding Butter Wave Radial Ripples (Goes beyond screen now)
-            val currentRadius = (maxDim * 1.4f) * wavePulse
-            val rippleAlpha = (1f - wavePulse).coerceIn(0f, 1f) * 0.28f
-
+            // Ambient upper-left cyan nebula bloom
+            val neb1X = width * 0.20f + sin(auraPhase) * (width * 0.12f)
+            val neb1Y = height * 0.20f + cos(harmonicPhase) * (height * 0.08f)
             drawCircle(
                 brush = Brush.radialGradient(
                     colors = listOf(
-                        Color(0xFF81D4FA).copy(alpha = rippleAlpha),
-                        Color(0xFF3F51B5).copy(alpha = rippleAlpha * 0.45f),
+                        Color(0xFF00E5FF).copy(alpha = 0.18f),
+                        Color(0xFF0284C7).copy(alpha = 0.07f),
                         Color.Transparent
                     ),
-                    center = Offset(centerX, centerY),
-                    radius = (currentRadius + 200f).coerceAtLeast(10f)
+                    center = Offset(neb1X, neb1Y),
+                    radius = maxDim * 0.58f
                 ),
-                center = Offset(centerX, centerY),
-                radius = currentRadius
+                center = Offset(neb1X, neb1Y),
+                radius = maxDim * 0.58f
             )
 
-            // 4. Drifting Full-Screen Glowing Particles
-            val particleCount = 28
-            for (i in 0 until particleCount) {
-                val seed = i * 137.5f
-                val startX = (sin(seed) * 0.5f + 0.5f) * width
-                val startY = (cos(seed) * 0.5f + 0.5f) * height
-                
-                // Full screen organic drift logic
-                val driftX = sin(particleTime * 2 * PI + seed).toFloat() * 120f
-                val driftY = cos(particleTime * 2 * PI + seed * 1.5f).toFloat() * 120f
-                
-                val px = (startX + driftX + width * 2) % width
-                val py = (startY + driftY + height * 2) % height
-                
-                val pAlpha = (sin(particleTime * 3 * PI + seed).toFloat() * 0.5f + 0.5f) * 0.7f
-                val pRadius = 2.dp.toPx() + (i % 4) * 2f
+            // Ambient lower-right royal violet nebula bloom
+            val neb2X = width * 0.80f - cos(auraPhase) * (width * 0.12f)
+            val neb2Y = height * 0.74f - sin(harmonicPhase) * (height * 0.08f)
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color(0xFFA855F7).copy(alpha = 0.16f),
+                        Color(0xFF4F46E5).copy(alpha = 0.07f),
+                        Color.Transparent
+                    ),
+                    center = Offset(neb2X, neb2Y),
+                    radius = maxDim * 0.58f
+                ),
+                center = Offset(neb2X, neb2Y),
+                radius = maxDim * 0.58f
+            )
 
+            // Volumetric Top Aurora Silk Curtains
+            val step = (width / 28f).coerceAtLeast(14f)
+            topCurtainPath1.rewind()
+            topCurtainPath1.moveTo(0f, 0f)
+            topCurtainPath1.lineTo(0f, height * 0.28f)
+            var x = 0f
+            while (x <= width + step) {
+                val y = height * 0.28f +
+                        sin(x * 0.0045f + auraPhase) * (height * 0.065f) +
+                        cos(x * 0.008f - harmonicPhase) * (height * 0.032f)
+                topCurtainPath1.lineTo(x, y)
+                x += step
+            }
+            topCurtainPath1.lineTo(width, 0f)
+            topCurtainPath1.close()
+            drawPath(
+                path = topCurtainPath1,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFF00E5FF).copy(alpha = 0.20f),
+                        Color(0xFF4F46E5).copy(alpha = 0.09f),
+                        Color.Transparent
+                    ),
+                    startY = 0f,
+                    endY = height * 0.38f
+                )
+            )
+
+            topCurtainPath2.rewind()
+            topCurtainPath2.moveTo(0f, height * 0.22f)
+            x = 0f
+            while (x <= width + step) {
+                val y = height * 0.22f +
+                        cos(x * 0.0055f - auraPhase * 1.2f) * (height * 0.05f) +
+                        sin(x * 0.009f + harmonicPhase) * (height * 0.025f)
+                topCurtainPath2.lineTo(x, y)
+                x += step
+            }
+            drawPath(
+                path = topCurtainPath2,
+                brush = Brush.horizontalGradient(
+                    colors = listOf(
+                        Color.Transparent,
+                        Color(0xFF38BDF8).copy(alpha = 0.34f),
+                        Color(0xFFA855F7).copy(alpha = 0.30f),
+                        Color.Transparent
+                    )
+                ),
+                style = Stroke(width = 2.2.dp.toPx(), cap = StrokeCap.Round)
+            )
+
+            // Volumetric Bottom Aurora Silk Curtains
+            bottomCurtainPath1.rewind()
+            bottomCurtainPath1.moveTo(0f, height)
+            bottomCurtainPath1.lineTo(0f, height * 0.74f)
+            x = 0f
+            while (x <= width + step) {
+                val y = height * 0.74f +
+                        sin(x * 0.0042f + harmonicPhase) * (height * 0.065f) +
+                        cos(x * 0.0075f - auraPhase) * (height * 0.03f)
+                bottomCurtainPath1.lineTo(x, y)
+                x += step
+            }
+            bottomCurtainPath1.lineTo(width, height)
+            bottomCurtainPath1.close()
+            drawPath(
+                path = bottomCurtainPath1,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        Color.Transparent,
+                        Color(0xFF6366F1).copy(alpha = 0.11f),
+                        Color(0xFFA855F7).copy(alpha = 0.22f)
+                    ),
+                    startY = height * 0.64f,
+                    endY = height
+                )
+            )
+
+            bottomCurtainPath2.rewind()
+            bottomCurtainPath2.moveTo(0f, height * 0.78f)
+            x = 0f
+            while (x <= width + step) {
+                val y = height * 0.78f +
+                        cos(x * 0.005f + auraPhase) * (height * 0.048f) +
+                        sin(x * 0.0085f - harmonicPhase) * (height * 0.024f)
+                bottomCurtainPath2.lineTo(x, y)
+                x += step
+            }
+            drawPath(
+                path = bottomCurtainPath2,
+                brush = Brush.horizontalGradient(
+                    colors = listOf(
+                        Color.Transparent,
+                        Color(0xFFC084FC).copy(alpha = 0.30f),
+                        Color(0xFF00E5FF).copy(alpha = 0.32f),
+                        Color.Transparent
+                    )
+                ),
+                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
+            )
+
+            // Ascending & Orbiting Luminous Photon Particles (24 depth-of-field light orbs)
+            for (i in 0 until 24) {
+                val seed = i * 83.7f
+                val horizontalWave = sin(auraPhase + i * 0.6f) * 32f
+                val sx = ((sin(seed) * 0.5f + 0.5f) * width + horizontalWave + width) % width
+                val upwardFlow = (auraPhase / (2 * PI).toFloat()) * height * 0.35f
+                val sy = (((cos(seed * 1.3f) * 0.5f + 0.5f) * height - upwardFlow) + height * 2f) % height
+                val twinkle = (sin(auraPhase * 2.2f + seed) * 0.5f + 0.5f).coerceIn(0.20f, 0.95f)
+                val orbCoreR = (1.5f + (i % 3) * 0.9f).dp.toPx()
+                val orbColor = when (i % 3) {
+                    0 -> Color(0xFF00E5FF)
+                    1 -> Color(0xFF818CF8)
+                    else -> Color(0xFFE879F9)
+                }
+                // Soft outer photon bloom
                 drawCircle(
                     brush = Brush.radialGradient(
                         colors = listOf(
-                            if (i % 2 == 0) Color(0xFF80DEEA).copy(alpha = pAlpha) else Color(0xFFE040FB).copy(alpha = pAlpha),
+                            orbColor.copy(alpha = twinkle * 0.42f),
                             Color.Transparent
-                        )
+                        ),
+                        center = Offset(sx, sy),
+                        radius = orbCoreR * 3.6f
                     ),
-                    center = Offset(px, py),
-                    radius = pRadius * 3f
+                    center = Offset(sx, sy),
+                    radius = orbCoreR * 3.6f
+                )
+                // Crisp bright photon core
+                drawCircle(
+                    color = Color.White.copy(alpha = twinkle * 0.85f),
+                    radius = orbCoreR * 0.75f,
+                    center = Offset(sx, sy)
                 )
             }
 
-            // 5. TOP Waves (Hanging down from the ceiling)
-            topWave1.rewind()
-            topWave1.moveTo(0f, height * 0.35f)
-            var x = 0f
-            while (x <= width + 20f) {
-                val y = height * 0.35f + sin(x * 0.004f + phase1) * 140f + cos(x * 0.007f - phase2) * 60f
-                topWave1.lineTo(x, y)
-                x += 10f
-            }
-            topWave1.lineTo(width, 0f)
-            topWave1.lineTo(0f, 0f)
-            topWave1.close()
-            drawPath(
-                path = topWave1,
-                brush = Brush.verticalGradient(
-                    colors = listOf(Color(0x441A237E), Color(0x153F51B5), Color.Transparent),
-                    startY = 0f, endY = height * 0.55f
-                )
-            )
-
-            topWave2.rewind()
-            topWave2.moveTo(0f, height * 0.20f)
-            x = 0f
-            while (x <= width + 20f) {
-                val y = height * 0.20f + sin(x * 0.006f - phase2) * 90f + sin(x * 0.01f + phase3) * 50f
-                topWave2.lineTo(x, y)
-                x += 10f
-            }
-            topWave2.lineTo(width, 0f)
-            topWave2.lineTo(0f, 0f)
-            topWave2.close()
-            drawPath(
-                path = topWave2,
-                brush = Brush.verticalGradient(
-                    colors = listOf(Color(0x5580DEEA), Color(0x153F51B5), Color.Transparent),
-                    startY = 0f, endY = height * 0.40f
-                )
-            )
-
-            // 6. BOTTOM Waves (Rising up from the floor)
-            bottomWave1.rewind()
-            bottomWave1.moveTo(0f, height * 0.65f)
-            x = 0f
-            while (x <= width + 20f) {
-                val y = height * 0.65f + sin(x * 0.005f + phase2) * 150f + sin(x * 0.008f - phase3) * 80f
-                bottomWave1.lineTo(x, y)
-                x += 10f
-            }
-            bottomWave1.lineTo(width, height)
-            bottomWave1.lineTo(0f, height)
-            bottomWave1.close()
-            drawPath(
-                path = bottomWave1,
-                brush = Brush.verticalGradient(
-                    colors = listOf(Color.Transparent, Color(0x22E040FB), Color(0x44311B92)),
-                    startY = height * 0.45f, endY = height
-                )
-            )
-
-            bottomWave2.rewind()
-            bottomWave2.moveTo(0f, height * 0.80f)
-            x = 0f
-            while (x <= width + 20f) {
-                val y = height * 0.80f + cos(x * 0.007f - phase1) * 100f + sin(x * 0.012f + phase2) * 55f
-                bottomWave2.lineTo(x, y)
-                x += 10f
-            }
-            bottomWave2.lineTo(width, height)
-            bottomWave2.lineTo(0f, height)
-            bottomWave2.close()
-            drawPath(
-                path = bottomWave2,
-                brush = Brush.verticalGradient(
-                    colors = listOf(Color.Transparent, Color(0x224FC3F7), Color(0x5500897B)),
-                    startY = height * 0.60f, endY = height
-                )
-            )
-
-            // 7. Dynamic Shimmer Energy Lines cutting across the screen
-            energyLine1.rewind()
-            energyLine1.moveTo(0f, height * 0.42f)
-            x = 0f
-            while (x <= width + 20f) {
-                val y = height * 0.42f + sin(x * 0.004f + phase1 * 1.4f) * 160f
-                energyLine1.lineTo(x, y)
-                x += 15f
-            }
-            drawPath(
-                path = energyLine1,
-                brush = Brush.horizontalGradient(
-                    colors = listOf(Color.Transparent, Color(0x6680DEEA), Color(0x66E040FB), Color.Transparent)
+            // CORE VOLUMETRIC AURA LAYERS (Behind the 3D Medallion)
+            // Layer A: Wide outer atmospheric halo
+            val outerAuraRadius = (minDim * 0.48f * auraBreath).coerceAtLeast(20f)
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color(0xFF00E5FF).copy(alpha = 0.25f),
+                        Color(0xFF6366F1).copy(alpha = 0.16f),
+                        Color(0xFFA855F7).copy(alpha = 0.08f),
+                        Color.Transparent
+                    ),
+                    center = Offset(centerX, centerY),
+                    radius = outerAuraRadius
                 ),
-                style = Stroke(width = 3.5.dp.toPx())
+                center = Offset(centerX, centerY),
+                radius = outerAuraRadius
             )
 
-            energyLine2.rewind()
-            energyLine2.moveTo(0f, height * 0.58f)
-            x = 0f
-            while (x <= width + 20f) {
-                val y = height * 0.58f + cos(x * 0.005f - phase2 * 1.3f) * 130f
-                energyLine2.lineTo(x, y)
-                x += 15f
+            // Layer B1 & B2: Dual staggered expanding light horizon rings
+            for (waveIdx in 0..1) {
+                val wavePhase = (horizonPulse + waveIdx * 0.5f) % 1f
+                val pulseRadius = (minDim * 0.16f) + (minDim * 0.34f * wavePhase)
+                val pulseAlpha = (1f - wavePhase).coerceIn(0f, 1f) * 0.36f
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            Color.Transparent,
+                            Color(0xFF00E5FF).copy(alpha = pulseAlpha * 0.55f),
+                            Color(0xFF818CF8).copy(alpha = pulseAlpha),
+                            Color.Transparent
+                        ),
+                        center = Offset(centerX, centerY),
+                        radius = pulseRadius.coerceAtLeast(12f)
+                    ),
+                    center = Offset(centerX, centerY),
+                    radius = pulseRadius.coerceAtLeast(12f)
+                )
             }
-            drawPath(
-                path = energyLine2,
-                brush = Brush.horizontalGradient(
-                    colors = listOf(Color.Transparent, Color(0x664FC3F7), Color(0x663F51B5), Color.Transparent)
+
+            // Layer C: Intense inner corona glow directly behind medallion
+            val innerCoronaRadius = (minDim * 0.24f / auraBreath).coerceAtLeast(16f)
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color(0xFF00E5FF).copy(alpha = 0.42f),
+                        Color(0xFF818CF8).copy(alpha = 0.24f),
+                        Color.Transparent
+                    ),
+                    center = Offset(centerX, centerY),
+                    radius = innerCoronaRadius
                 ),
-                style = Stroke(width = 2.5.dp.toPx())
+                center = Offset(centerX, centerY),
+                radius = innerCoronaRadius
             )
         }
 
-        // MAIN APP LOGO (StudyVerse Badge) with Shimmer & Progress Ring
-        Box(
+        // 2. FOREGROUND CONTENT: 3D MEDALLION + FROSTED GLASS TELEMETRY CARD
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
             modifier = Modifier
-                .scale(pulseScale)
-                .size(136.dp),
-            contentAlignment = Alignment.Center
+                .fillMaxSize()
+                .padding(horizontal = 28.dp)
         ) {
-            // Rotated Glowing Shimmer Aura Ring
-            Canvas(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .rotate(rotateAngle)
-            ) {
-                drawCircle(
-                    brush = Brush.sweepGradient(
-                        colors = listOf(
-                            Color(0xFF80DEEA),
-                            Color(0xFF3F51B5),
-                            Color(0xFFE040FB),
-                            Color(0x0080DEEA),
-                            Color(0xFF80DEEA)
-                        )
-                    ),
-                    style = Stroke(width = 3.dp.toPx())
-                )
-            }
-
-            // Dynamic Radial Progress Halo Ring
-            Canvas(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(4.dp)
-            ) {
-                val sweepAngle = (progress.coerceIn(0.05f, 1f)) * 360f
-                drawArc(
-                    brush = Brush.sweepGradient(
-                        colors = listOf(
-                            Color(0xFF80DEEA),
-                            Color(0xFFE040FB),
-                            Color(0xFF80DEEA)
-                        )
-                    ),
-                    startAngle = -90f,
-                    sweepAngle = sweepAngle,
-                    useCenter = false,
-                    style = Stroke(width = 3.5.dp.toPx(), cap = StrokeCap.Round)
-                )
-            }
-
-            // Inner StudyVerse Circular Badge Container
+            // 3D LAYERED GLASS MEDALLION, GYROSCOPIC ORBITS & PRECISION CHRONOGRAPH RINGS
             Box(
                 modifier = Modifier
-                    .size(118.dp)
-                    .clip(CircleShape)
-                    .background(
-                        Brush.linearGradient(
-                            colors = listOf(
-                                Color(0xFF80DEEA),
-                                Color(0xFF3F51B5),
-                                Color(0xFFE040FB)
-                            )
-                        )
-                    )
-                    .padding(3.dp)
-                    .clip(CircleShape)
-                    .background(Color(0xFF0D111E)),
+                    .scale(auraBreath)
+                    .size(226.dp),
                 contentAlignment = Alignment.Center
             ) {
+                // Concentric Orbital Rings, 3D Gyroscopic Ellipses & Precision Micro-Ticks
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val maxR = size.minDimension / 2f
+
+                    // 3D Perspective Gyroscopic Energy Rings (2 tilted 3D orbital planes)
+                    for (g in 0..1) {
+                        val tiltAngle = if (g == 0) primaryOrbitAngle + 28f else counterOrbitAngle - 32f
+                        val rx = maxR * 0.94f
+                        val ry = maxR * 0.36f
+                        val numSegments = 36
+                        for (s in 0 until numSegments) {
+                            val a1 = (s * (360f / numSegments)) * (PI / 180.0)
+                            val a2 = ((s + 1) * (360f / numSegments)) * (PI / 180.0)
+                            val tiltRad = tiltAngle * (PI / 180.0)
+                            val cosT = cos(tiltRad).toFloat()
+                            val sinT = sin(tiltRad).toFloat()
+
+                            val x1Local = cos(a1).toFloat() * rx
+                            val y1Local = sin(a1).toFloat() * ry
+                            val x2Local = cos(a2).toFloat() * rx
+                            val y2Local = sin(a2).toFloat() * ry
+
+                            val x1 = cx + (x1Local * cosT - y1Local * sinT)
+                            val y1 = cy + (x1Local * sinT + y1Local * cosT)
+                            val x2 = cx + (x2Local * cosT - y2Local * sinT)
+                            val y2 = cy + (x2Local * sinT + y2Local * cosT)
+
+                            val depthAlpha = ((sin(a1).toFloat() + 1f) * 0.5f).coerceIn(0.08f, 0.55f)
+                            drawLine(
+                                color = if (g == 0) Color(0xFF00E5FF).copy(alpha = depthAlpha * 0.65f)
+                                else Color(0xFFC084FC).copy(alpha = depthAlpha * 0.60f),
+                                start = Offset(x1, y1),
+                                end = Offset(x2, y2),
+                                strokeWidth = 1.4.dp.toPx(),
+                                cap = StrokeCap.Round
+                            )
+                        }
+
+                        // Orbiting photon satellite on each 3D gyroscopic ring
+                        val satAngle = (if (g == 0) primaryOrbitAngle * 2.2f else counterOrbitAngle * 2.0f) * (PI / 180.0)
+                        val tiltRad = tiltAngle * (PI / 180.0)
+                        val cosT = cos(tiltRad).toFloat()
+                        val sinT = sin(tiltRad).toFloat()
+                        val sxLocal = cos(satAngle).toFloat() * rx
+                        val syLocal = sin(satAngle).toFloat() * ry
+                        val satX = cx + (sxLocal * cosT - syLocal * sinT)
+                        val satY = cy + (sxLocal * sinT + syLocal * cosT)
+
+                        drawCircle(
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    Color.White,
+                                    if (g == 0) Color(0xFF00E5FF) else Color(0xFFE879F9),
+                                    Color.Transparent
+                                ),
+                                center = Offset(satX, satY),
+                                radius = 7.dp.toPx()
+                            ),
+                            center = Offset(satX, satY),
+                            radius = 7.dp.toPx()
+                        )
+                    }
+
+                    // Ring 1: Outer 60-Tick Precision Chronograph Dial
+                    val tickOuterR = maxR - 4.dp.toPx()
+                    val tickInnerMajorR = tickOuterR - 7.5.dp.toPx()
+                    val tickInnerMinorR = tickOuterR - 4.dp.toPx()
+                    val activeTickLimit = (effectiveSweepProgress * 60).toInt()
+
+                    for (t in 0 until 60) {
+                        val deg = t * 6f - 90f
+                        val rad = deg * (PI / 180.0)
+                        val isMajor = t % 5 == 0
+                        val innerR = if (isMajor) tickInnerMajorR else tickInnerMinorR
+                        val sx = cx + cos(rad).toFloat() * innerR
+                        val sy = cy + sin(rad).toFloat() * innerR
+                        val ex = cx + cos(rad).toFloat() * tickOuterR
+                        val ey = cy + sin(rad).toFloat() * tickOuterR
+                        val isActiveTick = t <= activeTickLimit
+
+                        drawLine(
+                            color = when {
+                                isActiveTick && isMajor -> Color(0xFF00E5FF).copy(alpha = 0.95f)
+                                isActiveTick -> Color(0xFF818CF8).copy(alpha = 0.65f)
+                                isMajor -> Color.White.copy(alpha = 0.24f)
+                                else -> Color.White.copy(alpha = 0.10f)
+                            },
+                            start = Offset(sx, sy),
+                            end = Offset(ex, ey),
+                            strokeWidth = if (isMajor) 1.9.dp.toPx() else 1.1.dp.toPx(),
+                            cap = StrokeCap.Round
+                        )
+                    }
+
+                    // Ring 2: Counter-Rotating Dual-Arc Specular Aura Ring
+                    val orbitRingR = maxR - 17.dp.toPx()
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.07f),
+                        radius = orbitRingR,
+                        style = Stroke(width = 1.2.dp.toPx())
+                    )
+                    drawArc(
+                        brush = Brush.sweepGradient(
+                            colors = listOf(
+                                Color.Transparent,
+                                Color(0xFF38BDF8).copy(alpha = 0.85f),
+                                Color(0xFFC084FC).copy(alpha = 0.90f),
+                                Color.Transparent
+                            )
+                        ),
+                        startAngle = counterOrbitAngle,
+                        sweepAngle = 145f,
+                        useCenter = false,
+                        topLeft = Offset(cx - orbitRingR, cy - orbitRingR),
+                        size = Size(orbitRingR * 2f, orbitRingR * 2f),
+                        style = Stroke(width = 2.4.dp.toPx(), cap = StrokeCap.Round)
+                    )
+                    drawArc(
+                        brush = Brush.sweepGradient(
+                            colors = listOf(
+                                Color.Transparent,
+                                Color(0xFF00E5FF).copy(alpha = 0.80f),
+                                Color(0xFF6366F1).copy(alpha = 0.85f),
+                                Color.Transparent
+                            )
+                        ),
+                        startAngle = counterOrbitAngle + 180f,
+                        sweepAngle = 115f,
+                        useCenter = false,
+                        topLeft = Offset(cx - orbitRingR, cy - orbitRingR),
+                        size = Size(orbitRingR * 2f, orbitRingR * 2f),
+                        style = Stroke(width = 2.4.dp.toPx(), cap = StrokeCap.Round)
+                    )
+
+                    // Ring 3: Primary Live Progress Arc with Glowing Leading Orb
+                    val progressRingR = maxR - 28.dp.toPx()
+                    val sweepDeg = effectiveSweepProgress * 360f
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.09f),
+                        radius = progressRingR,
+                        style = Stroke(width = 3.4.dp.toPx())
+                    )
+                    drawArc(
+                        brush = Brush.sweepGradient(
+                            colors = listOf(
+                                Color(0xFF00E5FF),
+                                Color(0xFF38BDF8),
+                                Color(0xFF818CF8),
+                                Color(0xFFC084FC),
+                                Color(0xFF00E5FF)
+                            )
+                        ),
+                        startAngle = -90f + primaryOrbitAngle * 0.2f,
+                        sweepAngle = sweepDeg,
+                        useCenter = false,
+                        topLeft = Offset(cx - progressRingR, cy - progressRingR),
+                        size = Size(progressRingR * 2f, progressRingR * 2f),
+                        style = Stroke(width = 3.8.dp.toPx(), cap = StrokeCap.Round)
+                    )
+
+                    // Leading light point at tip of progress arc
+                    val tipAngleRad = (-90f + primaryOrbitAngle * 0.2f + sweepDeg) * (PI / 180.0)
+                    val tipX = cx + cos(tipAngleRad).toFloat() * progressRingR
+                    val tipY = cy + sin(tipAngleRad).toFloat() * progressRingR
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                Color.White,
+                                Color(0xFF00E5FF).copy(alpha = 0.85f),
+                                Color.Transparent
+                            ),
+                            center = Offset(tipX, tipY),
+                            radius = 10.dp.toPx()
+                        ),
+                        center = Offset(tipX, tipY),
+                        radius = 10.dp.toPx()
+                    )
+                    drawCircle(
+                        color = Color.White,
+                        center = Offset(tipX, tipY),
+                        radius = 3.dp.toPx()
+                    )
+                }
+
+                // 3D OBSIDIAN & LIQUID-GLASS CORE MEDALLION
                 Box(
                     modifier = Modifier
-                        .fillMaxSize()
-                        .padding(6.dp)
+                        .size(138.dp)
+                        .shadow(
+                            elevation = 28.dp,
+                            shape = CircleShape,
+                            ambientColor = Color(0xFF00E5FF),
+                            spotColor = Color(0xFF6366F1)
+                        )
+                        .clip(CircleShape)
+                        .background(
+                            Brush.linearGradient(
+                                colors = listOf(
+                                    Color.White.copy(alpha = 0.55f),
+                                    Color(0xFF00E5FF).copy(alpha = 0.48f),
+                                    Color(0xFF1E293B).copy(alpha = 0.92f),
+                                    Color(0xFFA855F7).copy(alpha = 0.50f)
+                                ),
+                                start = Offset(0f, 0f),
+                                end = Offset(300f, 300f)
+                            )
+                        )
+                        .padding(2.4.dp)
                         .clip(CircleShape)
                         .background(
                             Brush.radialGradient(
                                 colors = listOf(
-                                    Color(0xFF1E2A4A),
-                                    Color(0xFF090D18)
+                                    Color(0xFF192542),
+                                    Color(0xFF0B1120),
+                                    Color(0xFF050811)
                                 )
                             )
                         ),
                     contentAlignment = Alignment.Center
                 ) {
+                    // Custom 3D Specular Lens Reflection + Geometric StudyVerse Book & Prism Crest
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val w = size.width
+                        val h = size.height
+                        val cx = w / 2f
+                        val cy = h / 2f
+
+                        // Subtle inner ambient core glow
+                        drawCircle(
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    Color(0xFF00E5FF).copy(alpha = 0.26f),
+                                    Color(0xFF6366F1).copy(alpha = 0.10f),
+                                    Color.Transparent
+                                ),
+                                center = Offset(cx, cy - h * 0.06f),
+                                radius = w * 0.44f
+                            ),
+                            center = Offset(cx, cy - h * 0.06f),
+                            radius = w * 0.44f
+                        )
+
+                        // Realistic Top-Left Curved Glass Specular Highlight
+                        drawArc(
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    Color.White.copy(alpha = 0.42f),
+                                    Color.White.copy(alpha = 0.08f),
+                                    Color.Transparent
+                                ),
+                                start = Offset(w * 0.15f, h * 0.10f),
+                                end = Offset(w * 0.65f, h * 0.55f)
+                            ),
+                            startAngle = 195f,
+                            sweepAngle = 120f,
+                            useCenter = false,
+                            topLeft = Offset(w * 0.07f, h * 0.07f),
+                            size = Size(w * 0.86f, h * 0.86f),
+                            style = Stroke(width = 2.6.dp.toPx(), cap = StrokeCap.Round)
+                        )
+
+                        // Custom Geometric Open Book Wings & Levitating Knowledge Prism
+                        val crestCenterY = cy - h * 0.05f
+                        val bookW = w * 0.24f
+                        val bookH = h * 0.18f
+                        val prismFloatOffset = sin(auraPhase * 2f) * (h * 0.025f)
+
+                        // Lower Secondary Book Page Accents (matches App Launcher Icon)
+                        bookLeftPath.rewind()
+                        bookLeftPath.moveTo(cx - w * 0.01f, crestCenterY + bookH * 0.72f)
+                        bookLeftPath.lineTo(cx - bookW * 0.94f, crestCenterY + bookH * 0.42f)
+                        bookLeftPath.lineTo(cx - bookW * 0.94f, crestCenterY + bookH * 0.28f)
+                        bookLeftPath.lineTo(cx - w * 0.01f, crestCenterY + bookH * 0.58f)
+                        bookLeftPath.close()
+                        drawPath(
+                            path = bookLeftPath,
+                            color = Color(0xFF00E5FF).copy(alpha = 0.42f)
+                        )
+
+                        bookRightPath.rewind()
+                        bookRightPath.moveTo(cx + w * 0.01f, crestCenterY + bookH * 0.72f)
+                        bookRightPath.lineTo(cx + bookW * 0.94f, crestCenterY + bookH * 0.42f)
+                        bookRightPath.lineTo(cx + bookW * 0.94f, crestCenterY + bookH * 0.28f)
+                        bookRightPath.lineTo(cx + w * 0.01f, crestCenterY + bookH * 0.58f)
+                        bookRightPath.close()
+                        drawPath(
+                            path = bookRightPath,
+                            color = Color(0xFFC084FC).copy(alpha = 0.42f)
+                        )
+
+                        // Left Illuminated Book Wing
+                        bookLeftPath.rewind()
+                        bookLeftPath.moveTo(cx - w * 0.008f, crestCenterY + bookH * 0.52f)
+                        bookLeftPath.lineTo(cx - bookW, crestCenterY + bookH * 0.18f)
+                        bookLeftPath.lineTo(cx - bookW, crestCenterY - bookH * 0.55f)
+                        bookLeftPath.lineTo(cx - w * 0.008f, crestCenterY - bookH * 0.15f)
+                        bookLeftPath.close()
+                        drawPath(
+                            path = bookLeftPath,
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    Color(0xFF00E5FF),
+                                    Color(0xFF38BDF8).copy(alpha = 0.82f)
+                                ),
+                                start = Offset(cx - bookW, crestCenterY - bookH),
+                                end = Offset(cx, crestCenterY + bookH)
+                            )
+                        )
+
+                        // Right Illuminated Book Wing
+                        bookRightPath.rewind()
+                        bookRightPath.moveTo(cx + w * 0.008f, crestCenterY + bookH * 0.52f)
+                        bookRightPath.lineTo(cx + bookW, crestCenterY + bookH * 0.18f)
+                        bookRightPath.lineTo(cx + bookW, crestCenterY - bookH * 0.55f)
+                        bookRightPath.lineTo(cx + w * 0.008f, crestCenterY - bookH * 0.15f)
+                        bookRightPath.close()
+                        drawPath(
+                            path = bookRightPath,
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    Color(0xFF818CF8),
+                                    Color(0xFFC084FC).copy(alpha = 0.90f)
+                                ),
+                                start = Offset(cx, crestCenterY - bookH),
+                                end = Offset(cx + bookW, crestCenterY + bookH)
+                            )
+                        )
+
+                        // Levitating Diamond Knowledge Prism above the Book Spine
+                        val prismTopY = crestCenterY - bookH * 1.18f + prismFloatOffset
+                        val prismBottomY = crestCenterY - bookH * 0.34f + prismFloatOffset
+                        val prismMidY = (prismTopY + prismBottomY) / 2f
+                        val prismHalfW = w * 0.088f
+
+                        prismPath.rewind()
+                        prismPath.moveTo(cx, prismTopY)
+                        prismPath.lineTo(cx + prismHalfW, prismMidY)
+                        prismPath.lineTo(cx, prismBottomY)
+                        prismPath.lineTo(cx - prismHalfW, prismMidY)
+                        prismPath.close()
+
+                        drawPath(
+                            path = prismPath,
+                            brush = Brush.linearGradient(
+                                colors = listOf(
+                                    Color.White,
+                                    Color(0xFF00E5FF),
+                                    Color(0xFFC084FC)
+                                ),
+                                start = Offset(cx - prismHalfW, prismTopY),
+                                end = Offset(cx + prismHalfW, prismBottomY)
+                            )
+                        )
+
+                        // Inner Bright Core Facet of Knowledge Prism
+                        val innerPrismHalfW = prismHalfW * 0.54f
+                        val innerPrismTopY = prismTopY + (prismBottomY - prismTopY) * 0.16f
+                        val innerPrismBottomY = prismBottomY - (prismBottomY - prismTopY) * 0.28f
+                        prismPath.rewind()
+                        prismPath.moveTo(cx, innerPrismTopY)
+                        prismPath.lineTo(cx + innerPrismHalfW, prismMidY)
+                        prismPath.lineTo(cx, innerPrismBottomY)
+                        prismPath.lineTo(cx - innerPrismHalfW, prismMidY)
+                        prismPath.close()
+                        drawPath(
+                            path = prismPath,
+                            color = Color.White.copy(alpha = 0.72f)
+                        )
+
+                        // Dynamic Specular Shimmer Sweep across Medallion Lens
+                        val sweepX = w * shimmerSweep
+                        drawCircle(
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    Color.White.copy(alpha = 0.18f),
+                                    Color.Transparent
+                                ),
+                                center = Offset(sweepX, h * 0.35f),
+                                radius = w * 0.45f
+                            ),
+                            center = Offset(sweepX, h * 0.35f),
+                            radius = w * 0.45f
+                        )
+                    }
+
+                    // Crisp Typography Lockup inside Bottom of Medallion
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
+                        verticalArrangement = Arrangement.Bottom,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(bottom = 20.dp)
                     ) {
-                        // StudyVerse Graduation Cap & Sparkles Emblem
-                        Box(
-                            contentAlignment = Alignment.Center,
-                            modifier = Modifier.size(54.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.School,
-                                contentDescription = "StudyVerse App Icon",
-                                tint = Color(0xFF80DEEA),
-                                modifier = Modifier.size(48.dp)
-                            )
-                            Icon(
-                                imageVector = Icons.Default.AutoAwesome,
-                                contentDescription = null,
-                                tint = Color(0xFFE040FB),
-                                modifier = Modifier
-                                    .size(20.dp)
-                                    .align(Alignment.TopEnd)
-                            )
-                        }
-                        
-                        Spacer(modifier = Modifier.height(2.dp))
-                        
                         Text(
                             text = "STUDYVERSE",
                             style = MaterialTheme.typography.labelMedium.copy(
                                 fontWeight = FontWeight.ExtraBold,
-                                fontSize = 9.sp,
-                                letterSpacing = 1.2.sp
+                                fontSize = 9.5.sp,
+                                letterSpacing = 1.8.sp
                             ),
-                            color = Color.White
+                            color = Color(0xFFF8FAFC)
                         )
                     }
                 }
+            }
+
+            Spacer(modifier = Modifier.height(34.dp))
+
+            // 3. REALISTIC FROSTED GLASS TELEMETRY & PROGRESS PILL
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .widthIn(min = 270.dp, max = 340.dp)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0xFF151F36).copy(alpha = 0.82f),
+                                Color(0xFF090E1A).copy(alpha = 0.92f)
+                            )
+                        )
+                    )
+                    .border(
+                        BorderStroke(
+                            1.1.dp,
+                            Brush.linearGradient(
+                                colors = listOf(
+                                    Color.White.copy(alpha = 0.32f),
+                                    Color(0xFF00E5FF).copy(alpha = 0.28f),
+                                    Color(0xFFA855F7).copy(alpha = 0.18f)
+                                )
+                            )
+                        ),
+                        RoundedCornerShape(24.dp)
+                    )
+                    .padding(horizontal = 22.dp, vertical = 18.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .scale(auraBreath)
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF00E5FF))
+                        )
+                        Text(
+                            text = "STUDYVERSE AURA",
+                            color = Color(0xFFBAE6FD),
+                            fontSize = 10.5.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 1.4.sp
+                        )
+                    }
+
+                    Text(
+                        text = "$displayPercent%",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Realistic Glass Progress Bar with Animated Specular Fill
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(CircleShape)
+                        .background(Color.White.copy(alpha = 0.08f))
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(effectiveSweepProgress)
+                            .fillMaxHeight()
+                            .clip(CircleShape)
+                            .background(
+                                Brush.horizontalGradient(
+                                    colors = listOf(
+                                        Color(0xFF00E5FF),
+                                        Color(0xFF38BDF8),
+                                        Color(0xFF818CF8),
+                                        Color(0xFFC084FC)
+                                    )
+                                )
+                            )
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
+                    text = statusStageText,
+                    color = Color(0xFF94A3B8),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
     }
 }
 
 private fun isNetworkAvailable(context: Context): Boolean {
-    val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        ?: return false
-    val activeNetwork = connectivityManager.activeNetwork ?: return false
-    val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return false
-    return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    return NetworkMonitor.isOnline(context)
 }
 
 /**
  * Chrome-style compact Floating Ball Menu for WebView with:
- * - Active site header badge & close button
- * - Refresh Current Page primary button
+ * - Zero site/domain name clutter
+ * - Refresh Current Page primary button + Close button
  * - Swipe-to-Refresh Protection Switch (OFF by default so scrolling upward never wipes out page content)
  * - 3-Column Chrome Quick Navigation Bar (Back, Forward, Scroll Top — no PDF Opener column)
  */
 @Composable
 fun WebFloatingBallChromeMenu(
-    siteHost: String,
     canGoBack: Boolean,
     canGoForward: Boolean,
     swipeToRefreshEnabled: Boolean,
@@ -2423,46 +2898,38 @@ fun WebFloatingBallChromeMenu(
                 verticalArrangement = Arrangement.spacedBy(11.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                // Header: Site Hostname & Close Button
+                // 1. Primary Chrome-style Refresh Page Button + Close Button Row (No site name displayed)
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(9.dp),
+                    Surface(
+                        onClick = onRefreshPage,
+                        shape = RoundedCornerShape(16.dp),
+                        color = Color(0xFF38BDF8).copy(alpha = 0.14f),
+                        border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.42f)),
                         modifier = Modifier.weight(1f)
                     ) {
-                        Box(
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center,
                             modifier = Modifier
-                                .size(30.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF38BDF8).copy(alpha = 0.14f))
-                                .border(0.8.dp, Color(0xFF38BDF8).copy(alpha = 0.35f), CircleShape),
-                            contentAlignment = Alignment.Center
+                                .fillMaxWidth()
+                                .padding(vertical = 11.dp, horizontal = 12.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Default.School,
-                                contentDescription = null,
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Refresh Page",
                                 tint = Color(0xFF38BDF8),
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(19.dp)
                             )
-                        }
-                        Column {
+                            Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = siteHost,
+                                text = "Refresh Current Page",
                                 color = Color(0xFFF8FAFC),
-                                fontSize = 13.5.sp,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = "Quick Page Controls",
-                                color = Color(0xFF94A3B8),
-                                fontSize = 10.5.sp,
-                                fontWeight = FontWeight.Medium
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
                             )
                         }
                     }
@@ -2474,47 +2941,16 @@ fun WebFloatingBallChromeMenu(
                         border = BorderStroke(0.8.dp, Color.White.copy(alpha = 0.18f))
                     ) {
                         Box(
-                            modifier = Modifier.size(32.dp),
+                            modifier = Modifier.size(40.dp),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Close,
                                 contentDescription = "Close Menu",
                                 tint = Color(0xFFE2E8F0),
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(17.dp)
                             )
                         }
-                    }
-                }
-
-                // 1. Primary Chrome-style Refresh Page Button
-                Surface(
-                    onClick = onRefreshPage,
-                    shape = RoundedCornerShape(16.dp),
-                    color = Color(0xFF38BDF8).copy(alpha = 0.14f),
-                    border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.42f)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 11.dp, horizontal = 14.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "Refresh Page",
-                            tint = Color(0xFF38BDF8),
-                            modifier = Modifier.size(19.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Refresh Current Page",
-                            color = Color(0xFFF8FAFC),
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Bold
-                        )
                     }
                 }
 

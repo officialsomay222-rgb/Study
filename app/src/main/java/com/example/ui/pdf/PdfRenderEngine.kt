@@ -17,7 +17,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.coroutines.coroutineContext
 import kotlin.math.roundToInt
+import kotlinx.coroutines.ensureActive
 
 /**
  * Modes of document interaction in the PDF viewer.
@@ -41,10 +43,12 @@ enum class PaperTheme {
  *
  * - Pre-computes page aspect ratios so LazyColumn items have exact final heights from frame 0
  *   with zero layout jumps during fast scrolling.
+ * - Checks coroutineContext.ensureActive() before and inside renderMutex so pages scrolled past
+ *   during a fast fling are skipped in 0ms without blocking visible pages.
  * - Calls Bitmap.prepareToDraw() and caches ImageBitmap on Dispatchers.IO so GPU texture upload
  *   never blocks the main UI thread.
- * - Suspends heavy HD/Ultra-HD work while the user is actively scrolling so CPU/GPU power is used
- *   strictly on demand when the user stops on a page.
+ * - Suspends heavy HD/Ultra-HD work while the user is actively scrolling or zooming so CPU/GPU power
+ *   is used strictly on demand when settled.
  */
 class PdfRenderEngine(
     val file: File,
@@ -80,7 +84,7 @@ class PdfRenderEngine(
             }
         }
     }
-    private val imageBitmapCache = LruCache<Int, ImageBitmap>(120)
+    private val imageBitmapCache = LruCache<Int, ImageBitmap>(140)
 
     init {
         val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
@@ -110,6 +114,8 @@ class PdfRenderEngine(
                 for (i in 0 until pageCount) {
                     pageAspectRatios[i] = defaultAspectRatio
                 }
+                // Pre-warm initial page previews in background
+                triggerPrefetchPreview(0)
             }
         } catch (e: Throwable) {
             try {
@@ -202,13 +208,15 @@ class PdfRenderEngine(
     }
 
     /**
-     * Renders or retrieves a lightweight low-res preview ImageBitmap on demand for 120fps scrolling.
+     * Renders or retrieves a lightweight low-res preview ImageBitmap on demand for 60/120fps scrolling.
      */
     suspend fun getPreviewImage(pageIndex: Int): ImageBitmap? = withContext(Dispatchers.IO) {
         if (isClosed || pageIndex < 0 || pageIndex >= pageCount) return@withContext null
         getCachedPreviewImage(pageIndex)?.let { return@withContext it }
+        coroutineContext.ensureActive()
 
         renderMutex.withLock {
+            coroutineContext.ensureActive()
             if (isClosed) return@withContext null
             getCachedPreviewImage(pageIndex)?.let { return@withContext it }
             val rend = renderer ?: return@withContext null
@@ -221,8 +229,8 @@ class PdfRenderEngine(
                     pageAspectRatios[pageIndex] = (baseWidth.toFloat() / baseHeight.toFloat()).coerceIn(0.2f, 5.0f)
                     val heightOverWidth = baseHeight.toFloat() / baseWidth.toFloat()
 
-                    val previewWidth = 500
-                    val previewHeight = (previewWidth * heightOverWidth).roundToInt().coerceIn(80, 1100)
+                    val previewWidth = 360
+                    val previewHeight = (previewWidth * heightOverWidth).roundToInt().coerceIn(80, 820)
 
                     // PdfRenderer.Page.render strictly requires Bitmap.Config.ARGB_8888
                     val bmp = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.ARGB_8888)
@@ -242,7 +250,6 @@ class PdfRenderEngine(
                 imageBitmapCache.evictAll()
                 null
             } catch (e: Throwable) {
-                e.printStackTrace()
                 null
             }
         }
@@ -256,10 +263,12 @@ class PdfRenderEngine(
         val targetKey = if (ultraHd) ultraHdKey(pageIndex) else hdKey(pageIndex)
         getOrWrapImageBitmap(targetKey)?.let { return@withContext it }
 
-        // Do not waste CPU/GPU power on HD rendering while user is actively scrolling
+        // Do not waste CPU/GPU power on HD rendering while user is actively scrolling or zooming
         if (isUserActivelyScrolling) return@withContext null
+        coroutineContext.ensureActive()
 
         renderMutex.withLock {
+            coroutineContext.ensureActive()
             if (isClosed || isUserActivelyScrolling) return@withContext null
             getOrWrapImageBitmap(targetKey)?.let { return@withContext it }
             val rend = renderer ?: return@withContext null
@@ -273,12 +282,12 @@ class PdfRenderEngine(
                     val heightOverWidth = baseHeight.toFloat() / baseWidth.toFloat()
 
                     val desiredWidth = if (ultraHd) {
-                        maxOf((baseWidth * screenDensity * 1.50f).roundToInt(), 1600).coerceIn(1400, 1920)
+                        maxOf((baseWidth * screenDensity * 1.35f).roundToInt(), 1440).coerceIn(1320, 1680)
                     } else {
-                        maxOf((baseWidth * screenDensity * 1.12f).roundToInt(), 1160).coerceIn(1040, 1400)
+                        maxOf((baseWidth * screenDensity * 1.02f).roundToInt(), 1020).coerceIn(960, 1220)
                     }
 
-                    val maxAllowedHeight = if (ultraHd) 2600 else 2040
+                    val maxAllowedHeight = if (ultraHd) 2240 else 1760
                     val rawHeight = (desiredWidth * heightOverWidth).roundToInt().coerceAtLeast(1)
                     val (targetWidth, targetHeight) = if (rawHeight > maxAllowedHeight) {
                         val clampedH = maxAllowedHeight
@@ -310,7 +319,6 @@ class PdfRenderEngine(
                 System.gc()
                 if (ultraHd) getCachedSharpImage(pageIndex, ultraHd = false) else renderFallbackPage(pageIndex)
             } catch (e: Throwable) {
-                e.printStackTrace()
                 null
             }
         }
@@ -325,8 +333,8 @@ class PdfRenderEngine(
                 val baseWidth = page.width.coerceAtLeast(1)
                 val baseHeight = page.height.coerceAtLeast(1)
                 val heightOverWidth = baseHeight.toFloat() / baseWidth.toFloat()
-                val targetWidth = 840
-                val targetHeight = (targetWidth * heightOverWidth).roundToInt().coerceIn(100, 1560)
+                val targetWidth = 760
+                val targetHeight = (targetWidth * heightOverWidth).roundToInt().coerceIn(100, 1400)
                 val bmp = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(bmp)
                 canvas.drawColor(Color.WHITE)
@@ -344,12 +352,18 @@ class PdfRenderEngine(
     }
 
     /**
-     * Pre-renders lightweight previews of adjacent pages (+/- 2) only when idle so scrolling never hits a blank frame.
+     * Pre-renders lightweight previews of adjacent pages (+/- 3) when idle so scrolling never hits a blank frame.
      */
     private fun triggerPrefetchPreview(currentIndex: Int) {
         if (isClosed || isUserActivelyScrolling) return
         scope.launch {
-            val prefetchIndices = intArrayOf(currentIndex + 1, currentIndex - 1, currentIndex + 2)
+            val prefetchIndices = intArrayOf(
+                currentIndex,
+                currentIndex + 1,
+                currentIndex + 2,
+                currentIndex - 1,
+                currentIndex + 3
+            )
             for (idx in prefetchIndices) {
                 if (isClosed || isUserActivelyScrolling) break
                 if (idx in 0 until pageCount && getCachedPreviewOnly(idx) == null) {
@@ -363,8 +377,8 @@ class PdfRenderEngine(
                                     val baseHeight = page.height.coerceAtLeast(1)
                                     pageAspectRatios[idx] = (baseWidth.toFloat() / baseHeight.toFloat()).coerceIn(0.2f, 5.0f)
                                     val heightOverWidth = baseHeight.toFloat() / baseWidth.toFloat()
-                                    val previewWidth = 500
-                                    val previewHeight = (previewWidth * heightOverWidth).roundToInt().coerceIn(80, 1100)
+                                    val previewWidth = 360
+                                    val previewHeight = (previewWidth * heightOverWidth).roundToInt().coerceIn(80, 820)
 
                                     val bmp = Bitmap.createBitmap(previewWidth, previewHeight, Bitmap.Config.ARGB_8888)
                                     val canvas = Canvas(bmp)

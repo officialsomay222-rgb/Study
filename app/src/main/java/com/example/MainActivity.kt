@@ -365,6 +365,7 @@ fun WebViewScreen(
     var canGoBack by remember { mutableStateOf(false) }
     var canGoForward by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(true) }
+    var hasCompletedInitialBoot by remember { mutableStateOf(savedState != null) }
     var progress by remember { mutableFloatStateOf(0f) }
     var hasError by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
@@ -542,8 +543,11 @@ fun WebViewScreen(
         }
     }
 
-    LaunchedEffect(webView) {
-        if (webView != null) {
+    // Defer Firebase RemoteConfig & MediaSession initialization until after the initial page is interactive
+    // so they never compete with Chromium's cold-start CPU/IO during the first 25 seconds.
+    LaunchedEffect(webView, hasCompletedInitialBoot) {
+        if (webView != null && hasCompletedInitialBoot) {
+            kotlinx.coroutines.delay(12_000L)
             try {
                 val remoteConfig = Firebase.remoteConfig
                 val configSettings = remoteConfigSettings {
@@ -553,21 +557,10 @@ fun WebViewScreen(
                 remoteConfig.fetchAndActivate().addOnCompleteListener { task ->
                     if (task.isSuccessful) {
                         try {
+                            val wv = webView ?: return@addOnCompleteListener
                             val customUserAgent = remoteConfig.getString("webview_user_agent")
-                            if (customUserAgent.isNotEmpty()) {
-                                webView?.settings?.userAgentString = customUserAgent
-                            }
-                            
-                            if (remoteConfig.all.containsKey("webview_cache_mode")) {
-                                webView?.settings?.cacheMode = remoteConfig.getLong("webview_cache_mode").toInt()
-                            }
-                            
-                            if (remoteConfig.all.containsKey("webview_java_script_enabled")) {
-                                webView?.settings?.javaScriptEnabled = remoteConfig.getBoolean("webview_java_script_enabled")
-                            }
-                            
-                            if (remoteConfig.all.containsKey("webview_dom_storage_enabled")) {
-                                webView?.settings?.domStorageEnabled = remoteConfig.getBoolean("webview_dom_storage_enabled")
+                            if (customUserAgent.isNotEmpty() && wv.settings.userAgentString != customUserAgent) {
+                                wv.settings.userAgentString = customUserAgent
                             }
                         } catch (e: Exception) {
                             e.printStackTrace()
@@ -575,15 +568,22 @@ fun WebViewScreen(
                     }
                 }
             } catch (e: Exception) {
-                // Firebase might not be initialized if google-services.json is missing
                 e.printStackTrace()
             }
         }
     }
 
-    DisposableEffect(context) {
-        val mediaSession = setupStudyVerseMediaSession(context)
+    DisposableEffect(context, hasCompletedInitialBoot) {
+        var mediaSession: MediaSession? = null
+        val job = if (hasCompletedInitialBoot) {
+            coroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                kotlinx.coroutines.delay(6_000L)
+                val created = setupStudyVerseMediaSession(context)
+                mediaSession = created
+            }
+        } else null
         onDispose {
+            job?.cancel()
             try {
                 mediaSession?.isActive = false
                 mediaSession?.release()
@@ -708,6 +708,8 @@ fun WebViewScreen(
                     val density = ctx.resources.displayMetrics.density
                     val defaultLayerType = if (isEmulatorDevice) View.LAYER_TYPE_SOFTWARE else View.LAYER_TYPE_NONE
                     var lastAppliedSettingsKey = ""
+                    var cachedRulesJsonStr = studyPrefs.getString("domain_rules", "{}") ?: "{}"
+                    var cachedRulesJson = try { org.json.JSONObject(cachedRulesJsonStr) } catch (_: Throwable) { org.json.JSONObject() }
 
                     val swipeRefreshLayout = SwipeRefreshLayout(ctx).apply {
                         setColorSchemeColors(
@@ -723,12 +725,14 @@ fun WebViewScreen(
                     fun applyDynamicSettings(targetUrl: String?, webView: WebView, forceUpdate: Boolean = false) {
                         if (targetUrl == null) return
                         try {
-                            val prefs = ctx.getSharedPreferences("StudyVersePrefs", Context.MODE_PRIVATE)
-                            val rulesJsonStr = prefs.getString("domain_rules", "{}") ?: "{}"
+                            if (forceUpdate) {
+                                cachedRulesJsonStr = studyPrefs.getString("domain_rules", "{}") ?: "{}"
+                                cachedRulesJson = try { org.json.JSONObject(cachedRulesJsonStr) } catch (_: Throwable) { org.json.JSONObject() }
+                            }
                             val host = android.net.Uri.parse(targetUrl).host ?: ""
-                            val settingsKey = "$host|$rulesJsonStr"
+                            val settingsKey = "$host|$cachedRulesJsonStr"
 
-                            val rulesJson = org.json.JSONObject(rulesJsonStr)
+                            val rulesJson = cachedRulesJson
                             
                             var zoom = true
                             var pullToRefresh = true
@@ -1071,10 +1075,13 @@ fun WebViewScreen(
 
                             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                                 val nextProg = newProgress / 100f
-                                if (isLoading && (kotlin.math.abs(nextProg - progress) >= 0.04f || newProgress >= 95)) {
+                                if (isLoading && (kotlin.math.abs(nextProg - progress) >= 0.05f || newProgress >= 75)) {
                                     progress = nextProg
                                 }
-                                if (newProgress >= 95) {
+                                if (newProgress >= 75 && !hasCompletedInitialBoot) {
+                                    hasCompletedInitialBoot = true
+                                }
+                                if (newProgress >= 90) {
                                     if (isLoading) isLoading = false
                                     if (swipeRefreshLayout.isRefreshing) swipeRefreshLayout.isRefreshing = false
                                 }
@@ -1440,31 +1447,31 @@ fun WebViewScreen(
                                                 }
                                             }
                                         }
-                                        sendColor();
-                                        if (!window.__studyverse_theme_observer_installed) {
-                                            window.__studyverse_theme_observer_installed = true;
-                                            var themeTimer = null;
-                                            function scheduleSendColor() {
-                                                if (themeTimer) clearTimeout(themeTimer);
-                                                themeTimer = setTimeout(sendColor, 180);
+                                            sendColor();
+                                            if (!window.__studyverse_theme_observer_installed) {
+                                                window.__studyverse_theme_observer_installed = true;
+                                                var themeTimer = null;
+                                                function scheduleSendColor() {
+                                                    if (themeTimer) clearTimeout(themeTimer);
+                                                    themeTimer = setTimeout(sendColor, 260);
+                                                }
+                                                // Observe ONLY theme attributes on html/body (never document.head childList/subtree,
+                                                // which Next.js mutates dozens of times during initial 25s prefetching!)
+                                                var observer = new MutationObserver(scheduleSendColor);
+                                                if (document.documentElement) {
+                                                    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme', 'data-mode', 'data-color-scheme'] });
+                                                }
+                                                if (document.body) {
+                                                    observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme', 'data-mode', 'data-color-scheme'] });
+                                                }
                                             }
-                                            var observer = new MutationObserver(scheduleSendColor);
-                                            if (document.head) {
-                                                observer.observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['content'] });
-                                            }
-                                            if (document.documentElement) {
-                                                observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme', 'data-mode', 'data-color-scheme'] });
-                                            }
-                                            if (document.body) {
-                                                observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme', 'data-mode', 'data-color-scheme'] });
-                                            }
-                                        }
-                                    })();
-                                """.trimIndent(), null)
+                                        })();
+                                    """.trimIndent(), null)
                             }
 
                             private fun installScrollAndSafetyGuard(view: WebView?) {
-                                val scrollGuardScript = """
+                                // Lightweight one-time fast-tap CSS & chunk-recovery listener (no JS scroll listener overhead)
+                                val safetyGuardScript = """
                                     (function() {
                                         if (!document.getElementById('__studyverse_fast_tap') && document.head) {
                                             var st = document.createElement('style');
@@ -1494,49 +1501,9 @@ fun WebViewScreen(
                                                 }
                                             });
                                         }
-                                        if (!window.__studyverse_scroll_guard_installed) {
-                                            window.__studyverse_scroll_guard_installed = true;
-                                            var lastReportedScrolled = null;
-                                            var settleTimer = null;
-                                            var activeScrollNode = null;
-
-                                            function getWinScroll() {
-                                                return (window.pageYOffset || window.scrollY || (document.documentElement && document.documentElement.scrollTop) || (document.body && document.body.scrollTop) || 0);
-                                            }
-
-                                            function checkAnyScrolledFast(target) {
-                                                if (getWinScroll() > 1) return true;
-                                                var el = target || activeScrollNode;
-                                                while (el && el !== document && el !== window) {
-                                                    if (el.scrollTop && el.scrollTop > 1) return true;
-                                                    el = el.parentElement;
-                                                }
-                                                return false;
-                                            }
-
-                                            // Zero-JNI during active scrolling or button taps: only report state once scrolling settles
-                                            function onScrollCapture(e) {
-                                                var t = e ? e.target : null;
-                                                if (t && t !== document && t !== window && t.scrollTop !== undefined) {
-                                                    activeScrollNode = t;
-                                                }
-                                                if (settleTimer) clearTimeout(settleTimer);
-                                                settleTimer = setTimeout(function() {
-                                                    var scrolled = checkAnyScrolledFast(activeScrollNode);
-                                                    if (scrolled !== lastReportedScrolled) {
-                                                        lastReportedScrolled = scrolled;
-                                                        if (window.AndroidApp && window.AndroidApp.reportScrollState) {
-                                                            window.AndroidApp.reportScrollState(scrolled);
-                                                        }
-                                                    }
-                                                }, 200);
-                                            }
-
-                                            window.addEventListener('scroll', onScrollCapture, { capture: true, passive: true });
-                                        }
                                     })();
                                 """.trimIndent()
-                                view?.evaluateJavascript(scrollGuardScript, null)
+                                view?.evaluateJavascript(safetyGuardScript, null)
                             }
 
                             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -1548,18 +1515,25 @@ fun WebViewScreen(
                                 view?.let { webView ->
                                     applyDynamicSettings(webView.url ?: url, webView)
                                 }
-
-                                installScrollAndSafetyGuard(view)
                             }
 
                             override fun onPageCommitVisible(view: WebView?, url: String?) {
                                 super.onPageCommitVisible(view, url)
+                                if (!hasCompletedInitialBoot) {
+                                    hasCompletedInitialBoot = true
+                                }
+                                if (isLoading) {
+                                    isLoading = false
+                                }
                                 syncMainFrameUrl(view)
                                 extractAndPostThemeColor(view)
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
+                                if (!hasCompletedInitialBoot) {
+                                    hasCompletedInitialBoot = true
+                                }
                                 isLoading = false
                                 swipeRefreshLayout.isRefreshing = false
                                 canGoBack = view?.canGoBack() == true
@@ -1785,11 +1759,11 @@ fun WebViewScreen(
                 )
             }
 
-            // Full Screen Animated Butter Wave Landing / Processing Overlay with StudyVerse Logo
+            // Full Screen Animated Butter Wave Landing Overlay (only during initial cold boot before first visible commit)
             AnimatedVisibility(
-                visible = isLoading && !hasError && activePdfSource == null,
-                enter = fadeIn(animationSpec = tween(250)),
-                exit = fadeOut(animationSpec = tween(350, easing = FastOutSlowInEasing))
+                visible = !hasCompletedInitialBoot && isLoading && !hasError && activePdfSource == null,
+                enter = fadeIn(animationSpec = tween(180)),
+                exit = fadeOut(animationSpec = tween(220, easing = FastOutSlowInEasing))
             ) {
                 LoadingOverlay(progress = progress)
             }

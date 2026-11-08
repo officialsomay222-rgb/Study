@@ -2,9 +2,11 @@ package com.example.ui.pdf
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import android.util.LruCache
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -40,6 +42,20 @@ enum class PaperTheme {
 }
 
 /**
+ * High-DPI vector-rasterized viewport tile for crystal-clear Google Drive-level text when zoomed in.
+ * Normalized coordinates [normLeft, normTop, normRight, normBottom] are in [0f..1f] page space.
+ */
+@Immutable
+data class ZoomedPageTile(
+    val bitmap: ImageBitmap,
+    val normLeft: Float,
+    val normTop: Float,
+    val normRight: Float,
+    val normBottom: Float,
+    val zoomBucket: Int
+)
+
+/**
  * Device-Adaptive On-Demand PDF Rendering Engine.
  *
  * - Annotated with [@Stable] so Jetpack Compose treats [PdfRenderEngine] as stable and skips
@@ -47,6 +63,8 @@ enum class PaperTheme {
  * - Scales preview, HD, and Ultra-HD resolutions according to [DevicePerformanceProfile]
  *   so 3-4GB RAM Cortex-A55 devices (e.g. Samsung Galaxy F13) render pages with 4x fewer pixels
  *   and zero GC stalls.
+ * - Renders zoomed-in viewport regions directly from native PDF vector outlines via [renderZoomedTile]
+ *   so text at 1.2x–4.0x zoom is razor-sharp like Google Drive PDF Viewer.
  * - Pre-warms initial pages on Dispatchers.IO before the viewer hides its loading overlay,
  *   completely eliminating the 10-second initial open lag storm.
  * - Preserves true PDF page aspect ratios across preview/HD/Ultra-HD bitmaps so pages never
@@ -74,12 +92,14 @@ class PdfRenderEngine(
     // Adaptive resolution bounds tuned per device tier
     private val previewTargetWidth: Int = perfProfile?.previewWidth ?: 256
     private val maxPreviewHeight: Int = perfProfile?.maxPreviewHeight ?: 580
-    private val hdTargetWidth: Int = perfProfile?.hdWidth ?: 780
-    private val maxHdHeight: Int = perfProfile?.maxHdHeight ?: 1260
-    private val ultraHdTargetWidth: Int = perfProfile?.ultraHdWidth ?: 1120
-    private val maxUltraHdHeight: Int = perfProfile?.maxUltraHdHeight ?: 1720
+    private val hdTargetWidth: Int = perfProfile?.hdWidth ?: 1080
+    private val maxHdHeight: Int = perfProfile?.maxHdHeight ?: 1680
+    private val ultraHdTargetWidth: Int = perfProfile?.ultraHdWidth ?: 1440
+    private val maxUltraHdHeight: Int = perfProfile?.maxUltraHdHeight ?: 2200
+    private val zoomTileTargetWidth: Int = perfProfile?.zoomTileWidth ?: 1240
+    private val maxZoomTileHeight: Int = perfProfile?.maxZoomTileHeight ?: 1860
 
-    val settleDelayMs: Long = perfProfile?.settleDelayMs ?: 240L
+    val settleDelayMs: Long = perfProfile?.settleDelayMs ?: 220L
     val flingGateDelayMs: Long = perfProfile?.flingGateDelayMs ?: 80L
 
     // Exact width/height aspect ratios per page derived strictly from PdfRenderer.Page dimensions
@@ -437,6 +457,89 @@ class PdfRenderEngine(
                 System.gc()
                 if (ultraHd) getCachedSharpImage(pageIndex, ultraHd = false) else renderFallbackPage(pageIndex)
             } catch (e: Throwable) {
+                null
+            }
+        }
+    }
+
+    /**
+     * Renders the visible sub-region [normLeft..normRight, normTop..normBottom] of [pageIndex]
+     * directly from native PDF vector font & path outlines at full screen pixel density using a transformation [Matrix].
+     * This delivers Google Drive-level razor-sharp text at any zoom level (1.15x–4.0x) without allocating giant full-page bitmaps.
+     */
+    suspend fun renderZoomedTile(
+        pageIndex: Int,
+        normLeft: Float,
+        normTop: Float,
+        normRight: Float,
+        normBottom: Float,
+        zoomScale: Float
+    ): ZoomedPageTile? = withContext(Dispatchers.IO) {
+        if (isClosed || pageIndex < 0 || pageIndex >= pageCount || zoomScale <= 1.12f) return@withContext null
+        if (isUserActivelyScrolling) return@withContext null
+        coroutineContext.ensureActive()
+
+        val l = normLeft.coerceIn(0f, 0.95f)
+        val t = normTop.coerceIn(0f, 0.95f)
+        val r = normRight.coerceIn(l + 0.05f, 1f)
+        val b = normBottom.coerceIn(t + 0.05f, 1f)
+
+        renderMutex.withLock {
+            coroutineContext.ensureActive()
+            if (isClosed || isUserActivelyScrolling) return@withContext null
+            val rend = renderer ?: return@withContext null
+
+            try {
+                val page = rend.openPage(pageIndex)
+                try {
+                    val baseWidth = page.width.coerceAtLeast(1)
+                    val baseHeight = page.height.coerceAtLeast(1)
+                    pageAspectRatios[pageIndex] = (baseWidth.toFloat() / baseHeight.toFloat()).coerceIn(0.2f, 5.0f)
+
+                    val cropLeftPts = l * baseWidth.toFloat()
+                    val cropTopPts = t * baseHeight.toFloat()
+                    val cropWidthPts = ((r - l) * baseWidth.toFloat()).coerceAtLeast(1f)
+                    val cropHeightPts = ((b - t) * baseHeight.toFloat()).coerceAtLeast(1f)
+
+                    val cropRatio = cropHeightPts / cropWidthPts
+                    var tileW = zoomTileTargetWidth
+                    var tileH = (tileW * cropRatio).roundToInt().coerceAtLeast(1)
+                    if (tileH > maxZoomTileHeight) {
+                        tileH = maxZoomTileHeight
+                        tileW = (tileH / cropRatio).roundToInt().coerceAtLeast(1)
+                    }
+
+                    val matrix = Matrix().apply {
+                        setTranslate(-cropLeftPts, -cropTopPts)
+                        postScale(tileW.toFloat() / cropWidthPts, tileH.toFloat() / cropHeightPts)
+                    }
+
+                    val bmp = Bitmap.createBitmap(tileW, tileH, Bitmap.Config.ARGB_8888)
+                    bmp.eraseColor(Color.WHITE)
+                    page.render(bmp, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    try {
+                        bmp.prepareToDraw()
+                    } catch (_: Throwable) {
+                    }
+
+                    ZoomedPageTile(
+                        bitmap = bmp.asImageBitmap(),
+                        normLeft = l,
+                        normTop = t,
+                        normRight = r,
+                        normBottom = b,
+                        zoomBucket = (zoomScale * 10f).roundToInt()
+                    )
+                } finally {
+                    try {
+                        page.close()
+                    } catch (_: Throwable) {
+                    }
+                }
+            } catch (oom: OutOfMemoryError) {
+                System.gc()
+                null
+            } catch (_: Throwable) {
                 null
             }
         }

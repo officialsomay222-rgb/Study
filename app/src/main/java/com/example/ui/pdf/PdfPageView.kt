@@ -1,5 +1,6 @@
 package com.example.ui.pdf
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -20,19 +21,28 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.findRootCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
- * Ultra-Fast Single-Quad PDF Page Renderer optimized for budget & mid-range GPUs (e.g. Samsung F13 / Exynos 850):
- * - Skips creating a [LaunchedEffect] coroutine entirely when the page's sharp bitmap is already in cache.
+ * Google Drive-Grade PDF Page Renderer with Vector Viewport Tile Overlay:
+ * - Renders base page in full High-DPI with [FilterQuality.Medium] mipmap interpolation for crisp 1x reading.
+ * - When zoomed in (`zoomScale > 1.12f`) and settled (`zoomViewportRevision > 0`), computes the exact visible
+ *   sub-region of the page on screen and rasterizes a native vector [ZoomedPageTile] directly from [android.graphics.pdf.PdfRenderer.Page]
+ *   at full screen pixel density — delivering razor-sharp vector text up to 4.0x zoom without allocating giant full-page bitmaps.
  * - Uses strict native page aspect ratio [PdfRenderEngine.getPageAspectRatio] and [ContentScale.FillBounds]
  *   so page height never shifts by even 1px and never creates gaps when unzooming or switching from preview to HD.
- * - Defers uncached bitmap allocation & GPU texture uploads while [PdfRenderEngine.isUserActivelyScrolling] is true,
- *   so fast swipe-flings glide at 60/120fps with zero mid-fling GPU stalls.
  */
 @Composable
 fun PdfSinglePageView(
@@ -42,6 +52,8 @@ fun PdfSinglePageView(
     isSwipeMode: Boolean = true,
     isHighZoom: Boolean = false,
     isUserScrolling: Boolean = false,
+    zoomScaleProvider: () -> Float = { 1f },
+    zoomViewportRevision: Int = 0,
     modifier: Modifier = Modifier
 ) {
     var previewImage by remember(pageIndex, engine) {
@@ -52,6 +64,17 @@ fun PdfSinglePageView(
             engine.getCachedSharpImage(pageIndex, ultraHd = isHighZoom)
                 ?: engine.getCachedSharpImage(pageIndex, ultraHd = false)
         )
+    }
+    var zoomedTile by remember(pageIndex, engine) {
+        mutableStateOf<ZoomedPageTile?>(null)
+    }
+    var pageCoords by remember {
+        mutableStateOf<LayoutCoordinates?>(null)
+    }
+
+    // Immediately clear zoomed tile when unzoomed back to 1x
+    if (zoomViewportRevision == 0 && zoomedTile != null) {
+        zoomedTile = null
     }
 
     val needsBackgroundRender = sharpImage == null || (isHighZoom && !engine.hasCachedUltraHd(pageIndex))
@@ -77,7 +100,6 @@ fun PdfSinglePageView(
                     previewImage = cachedPrev
                     break
                 }
-                // Wait while user is actively flinging so pages flying past never upload GPU textures mid-fling
                 while (isActive && engine.isUserActivelyScrolling) {
                     delay(engine.flingGateDelayMs)
                 }
@@ -91,8 +113,7 @@ fun PdfSinglePageView(
             }
 
             // 3. Wait for continuous stillness (settleDelayMs + stagger) and retry if interrupted by a scroll
-            // so visible pages ALWAYS reach crisp HD / Ultra-HD once the user stops scrolling.
-            val requiredStillMs = engine.settleDelayMs + (pageIndex % 2) * 55L
+            val requiredStillMs = engine.settleDelayMs + (pageIndex % 2) * 45L
             while (isActive) {
                 val cachedSharp = engine.getCachedSharpImage(pageIndex, ultraHd = isHighZoom)
                 if (cachedSharp != null) {
@@ -104,11 +125,11 @@ fun PdfSinglePageView(
                 while (isActive && quietElapsed < requiredStillMs) {
                     if (engine.isUserActivelyScrolling) {
                         quietElapsed = 0L
-                        delay(65L)
+                        delay(55L)
                     } else {
-                        delay(65L)
+                        delay(55L)
                         if (!engine.isUserActivelyScrolling) {
-                            quietElapsed += 65L
+                            quietElapsed += 55L
                         } else {
                             quietElapsed = 0L
                         }
@@ -121,7 +142,82 @@ fun PdfSinglePageView(
                     sharpImage = renderedSharp
                     break
                 }
-                delay(75L)
+                delay(65L)
+            }
+        }
+    }
+
+    // 4. Google Drive Vector Viewport Tile Renderer:
+    // Whenever zoom settles (zoomViewportRevision > 0), rasterize the visible crop directly from PDF vector paths
+    if (zoomViewportRevision > 0) {
+        LaunchedEffect(pageIndex, engine, zoomViewportRevision) {
+            val currentZoom = zoomScaleProvider()
+            if (currentZoom <= 1.12f) {
+                zoomedTile = null
+                return@LaunchedEffect
+            }
+            val coords = pageCoords
+            if (coords == null || !coords.isAttached) return@LaunchedEffect
+
+            val rootSize = coords.findRootCoordinates().size
+            val winW = rootSize.width.toFloat()
+            val winH = rootSize.height.toFloat()
+            if (winW <= 1f || winH <= 1f) return@LaunchedEffect
+
+            val bounds = coords.boundsInWindow()
+            if (bounds.width <= 1f || bounds.height <= 1f ||
+                bounds.right <= 0f || bounds.bottom <= 0f ||
+                bounds.left >= winW || bounds.top >= winH
+            ) {
+                zoomedTile = null
+                return@LaunchedEffect
+            }
+
+            val visLeft = ((0f - bounds.left) / bounds.width).coerceIn(0f, 1f)
+            val visTop = ((0f - bounds.top) / bounds.height).coerceIn(0f, 1f)
+            val visRight = ((winW - bounds.left) / bounds.width).coerceIn(0f, 1f)
+            val visBottom = ((winH - bounds.top) / bounds.height).coerceIn(0f, 1f)
+
+            if (visRight - visLeft < 0.03f || visBottom - visTop < 0.03f) {
+                zoomedTile = null
+                return@LaunchedEffect
+            }
+
+            // Add 12% overscan padding around visible viewport so small pans remain inside crisp vector tile
+            val padX = (visRight - visLeft) * 0.12f
+            val padY = (visBottom - visTop) * 0.12f
+            val normLeft = (visLeft - padX).coerceIn(0f, 0.95f)
+            val normTop = (visTop - padY).coerceIn(0f, 0.95f)
+            val normRight = (visRight + padX).coerceIn(normLeft + 0.05f, 1f)
+            val normBottom = (visBottom + padY).coerceIn(normTop + 0.05f, 1f)
+            val targetBucket = (currentZoom * 10f).roundToInt()
+
+            val existing = zoomedTile
+            if (existing != null &&
+                existing.zoomBucket == targetBucket &&
+                abs(existing.normLeft - normLeft) < 0.015f &&
+                abs(existing.normTop - normTop) < 0.015f &&
+                abs(existing.normRight - normRight) < 0.015f &&
+                abs(existing.normBottom - normBottom) < 0.015f
+            ) {
+                return@LaunchedEffect
+            }
+
+            while (isActive && engine.isUserActivelyScrolling) {
+                delay(45L)
+            }
+            if (!isActive) return@LaunchedEffect
+
+            val tile = engine.renderZoomedTile(
+                pageIndex = pageIndex,
+                normLeft = normLeft,
+                normTop = normTop,
+                normRight = normRight,
+                normBottom = normBottom,
+                zoomScale = currentZoom
+            )
+            if (isActive && tile != null && zoomScaleProvider() > 1.12f) {
+                zoomedTile = tile
             }
         }
     }
@@ -137,6 +233,7 @@ fun PdfSinglePageView(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(aspect)
+                .onGloballyPositioned { pageCoords = it }
                 .background(if (displayImage != null) Color.White else Color(0xFF141928)),
             contentAlignment = Alignment.Center
         ) {
@@ -146,9 +243,27 @@ fun PdfSinglePageView(
                     contentDescription = "Page ${pageIndex + 1}",
                     contentScale = ContentScale.FillBounds,
                     colorFilter = colorFilter,
-                    filterQuality = FilterQuality.Low,
+                    filterQuality = FilterQuality.Medium,
                     modifier = Modifier.fillMaxSize()
                 )
+                val activeTile = zoomedTile
+                if (activeTile != null) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val dstLeft = (activeTile.normLeft * size.width).roundToInt()
+                        val dstTop = (activeTile.normTop * size.height).roundToInt()
+                        val dstRight = (activeTile.normRight * size.width).roundToInt()
+                        val dstBottom = (activeTile.normBottom * size.height).roundToInt()
+                        val dstW = (dstRight - dstLeft).coerceAtLeast(1)
+                        val dstH = (dstBottom - dstTop).coerceAtLeast(1)
+                        drawImage(
+                            image = activeTile.bitmap,
+                            dstOffset = IntOffset(dstLeft, dstTop),
+                            dstSize = IntSize(dstW, dstH),
+                            colorFilter = colorFilter,
+                            filterQuality = FilterQuality.Medium
+                        )
+                    }
+                }
             } else {
                 Text(
                     text = "Page ${pageIndex + 1}",

@@ -6,9 +6,8 @@ import androidx.compose.runtime.Immutable
 
 /**
  * Hardware-aware adaptive performance profiler.
- * Automatically tunes PDF rendering resolutions, settle debounce timings, memory cache budgets,
- * and UI visual effect complexity according to the device's actual RAM and CPU capabilities
- * (e.g., budget 3-4GB Cortex-A55 phones like Samsung Galaxy F13 vs mid-range vs flagship devices).
+ * Automatically tunes PDF rendering resolutions, vector zoom-tile dimensions, settle debounce timings,
+ * and UI visual effect complexity according to the device's actual RAM and CPU capabilities.
  */
 @Immutable
 class DevicePerformanceProfile private constructor(
@@ -21,6 +20,8 @@ class DevicePerformanceProfile private constructor(
     val maxHdHeight: Int,
     val ultraHdWidth: Int,
     val maxUltraHdHeight: Int,
+    val zoomTileWidth: Int,
+    val maxZoomTileHeight: Int,
     val settleDelayMs: Long,
     val flingGateDelayMs: Long,
     val initialPrewarmPreviewCount: Int,
@@ -70,18 +71,20 @@ class DevicePerformanceProfile private constructor(
                         tier = Tier.LOW_END,
                         totalRamMb = totalRamMb,
                         cpuCores = cores,
-                        previewWidth = 224,
-                        maxPreviewHeight = 520,
-                        hdWidth = 680,
-                        maxHdHeight = 1120,
-                        ultraHdWidth = 1000,
-                        maxUltraHdHeight = 1540,
-                        settleDelayMs = 260L,
-                        flingGateDelayMs = 95L,
+                        previewWidth = 240,
+                        maxPreviewHeight = 560,
+                        hdWidth = 960,
+                        maxHdHeight = 1580,
+                        ultraHdWidth = 1280,
+                        maxUltraHdHeight = 1960,
+                        zoomTileWidth = 1080,
+                        maxZoomTileHeight = 1620,
+                        settleDelayMs = 220L,
+                        flingGateDelayMs = 90L,
                         initialPrewarmPreviewCount = 10,
-                        auraParticleCount = 10,
-                        gyroRingSegments = 18,
-                        waveStepDivisor = 14f,
+                        auraParticleCount = 8,
+                        gyroRingSegments = 16,
+                        waveStepDivisor = 12f,
                         useLightweightShadows = true
                     )
                     Tier.MID_RANGE -> DevicePerformanceProfile(
@@ -90,16 +93,18 @@ class DevicePerformanceProfile private constructor(
                         cpuCores = cores,
                         previewWidth = 280,
                         maxPreviewHeight = 640,
-                        hdWidth = 880,
-                        maxHdHeight = 1420,
-                        ultraHdWidth = 1280,
-                        maxUltraHdHeight = 1900,
-                        settleDelayMs = 200L,
-                        flingGateDelayMs = 75L,
+                        hdWidth = 1080,
+                        maxHdHeight = 1780,
+                        ultraHdWidth = 1440,
+                        maxUltraHdHeight = 2200,
+                        zoomTileWidth = 1240,
+                        maxZoomTileHeight = 1860,
+                        settleDelayMs = 180L,
+                        flingGateDelayMs = 70L,
                         initialPrewarmPreviewCount = 10,
-                        auraParticleCount = 16,
-                        gyroRingSegments = 24,
-                        waveStepDivisor = 20f,
+                        auraParticleCount = 12,
+                        gyroRingSegments = 22,
+                        waveStepDivisor = 18f,
                         useLightweightShadows = false
                     )
                     Tier.HIGH_END -> DevicePerformanceProfile(
@@ -108,16 +113,18 @@ class DevicePerformanceProfile private constructor(
                         cpuCores = cores,
                         previewWidth = 340,
                         maxPreviewHeight = 760,
-                        hdWidth = 1080,
-                        maxHdHeight = 1720,
-                        ultraHdWidth = 1520,
-                        maxUltraHdHeight = 2240,
-                        settleDelayMs = 150L,
-                        flingGateDelayMs = 55L,
+                        hdWidth = 1240,
+                        maxHdHeight = 2040,
+                        ultraHdWidth = 1680,
+                        maxUltraHdHeight = 2560,
+                        zoomTileWidth = 1440,
+                        maxZoomTileHeight = 2160,
+                        settleDelayMs = 140L,
+                        flingGateDelayMs = 50L,
                         initialPrewarmPreviewCount = 12,
-                        auraParticleCount = 24,
-                        gyroRingSegments = 36,
-                        waveStepDivisor = 28f,
+                        auraParticleCount = 18,
+                        gyroRingSegments = 30,
+                        waveStepDivisor = 24f,
                         useLightweightShadows = false
                     )
                 }

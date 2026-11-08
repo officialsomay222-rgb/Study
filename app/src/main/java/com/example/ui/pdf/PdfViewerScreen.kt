@@ -243,6 +243,7 @@ fun PdfViewerScreen(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var lastTapTime by remember { mutableLongStateOf(0L) }
     var settledHighZoom by remember { mutableStateOf(false) }
+    var zoomViewportRevision by remember { mutableIntStateOf(0) }
 
     val isNativeScrollEnabled by remember {
         derivedStateOf { zoomScale <= 1.02f }
@@ -268,16 +269,21 @@ fun PdfViewerScreen(
                             currentPageIndex = visibleIdx
                         }
                     }
-                    delay(95)
+                    delay(85)
                     if (lastScrollUpRef[0] && !barsVisible) {
                         barsVisible = true
                     }
-                    delay(110)
-                    val targetHigh = zoomScale >= 1.55f
+                    if (zoomScale > 1.12f) {
+                        zoomViewportRevision++
+                    } else if (zoomViewportRevision != 0) {
+                        zoomViewportRevision = 0
+                    }
+                    delay(80)
+                    val targetHigh = zoomScale >= 1.35f
                     if (settledHighZoom != targetHigh) {
                         settledHighZoom = targetHigh
                     }
-                    delay(260)
+                    delay(240)
                     if (renderEngine?.isUserActivelyScrolling == false) {
                         renderEngine?.prefetchNeighborsWhenIdle(currentPageIndex)
                     }
@@ -413,6 +419,7 @@ fun PdfViewerScreen(
         zoomScale = 1f
         panOffsetX = 0f
         panOffsetY = 0f
+        zoomViewportRevision = 0
         isDownloading = true
         errorMessage = null
 
@@ -543,6 +550,7 @@ fun PdfViewerScreen(
                 zoomScale = 1f
                 panOffsetX = 0f
                 panOffsetY = 0f
+                zoomViewportRevision = 0
             }
         }
     }
@@ -799,6 +807,7 @@ fun PdfViewerScreen(
                                 zoomScale = 1f
                                 panOffsetX = 0f
                                 panOffsetY = 0f
+                                zoomViewportRevision = 0
                             } else if (zoomScale > 4.0f) {
                                 animateZoomAndPan(
                                     4.0f,
@@ -879,6 +888,8 @@ fun PdfViewerScreen(
                             isSwipeMode = true,
                             isHighZoom = settledHighZoom,
                             isUserScrolling = false,
+                            zoomScaleProvider = { zoomScale },
+                            zoomViewportRevision = zoomViewportRevision,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(horizontal = 2.dp, vertical = pdfCapsuleClearance)
@@ -917,6 +928,8 @@ fun PdfViewerScreen(
                                 isSwipeMode = false,
                                 isHighZoom = settledHighZoom,
                                 isUserScrolling = false,
+                                zoomScaleProvider = { zoomScale },
+                                zoomViewportRevision = zoomViewportRevision,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(horizontal = 2.dp)

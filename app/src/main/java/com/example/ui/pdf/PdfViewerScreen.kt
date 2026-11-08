@@ -98,7 +98,10 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 import com.example.util.FileImportHelper
+import com.example.util.DevicePerformanceProfile
 import com.example.ui.pdf.DocxToPdfConverter
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 /**
  * Ultra-Premium Inbuilt PDF Viewer with:
@@ -122,6 +125,7 @@ fun PdfViewerScreen(
     val coroutineScope = rememberCoroutineScope()
     val displayMetrics = context.resources.displayMetrics
     val screenDensity = displayMetrics.densityDpi / 160f
+    val perfProfile = remember { DevicePerformanceProfile.get(context) }
 
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val cutoutTop = WindowInsets.displayCutout.asPaddingValues().calculateTopPadding()
@@ -173,8 +177,8 @@ fun PdfViewerScreen(
     var isVisible by remember { mutableStateOf(false) }
     var isClosing by remember { mutableStateOf(false) }
 
-    // Keep Game Mode system bars hidden across any recomposition while PDF viewer is active
-    SideEffect {
+    // Keep Game Mode system bars hidden without per-recomposition WindowManager IPC calls
+    LaunchedEffect(isClosing) {
         if (!isClosing) {
             val window = activity?.window
             if (window != null) {
@@ -214,7 +218,8 @@ fun PdfViewerScreen(
 
     // UI state: auto-hide ball & bars immediately on any scroll; show only when upward scroll stops
     var barsVisible by remember { mutableStateOf(true) }
-    var lastPdfScrollWasUp by remember { mutableStateOf(false) }
+    // Primitive reference for scroll direction so onPreScroll never mutates Compose Snapshot state during flings
+    val lastScrollUpRef = remember { BooleanArray(1) { false } }
     var isZoomGestureScrolling by remember { mutableStateOf(false) }
     var viewMode by remember { mutableStateOf(PdfViewMode.CONTINUOUS_FLOW) }
     var paperTheme by remember { mutableStateOf(PaperTheme.CLEAN_WHITE) }
@@ -231,50 +236,53 @@ fun PdfViewerScreen(
     // LazyListState for continuous vertical flow mode
     val listState = rememberLazyListState()
 
-    // Combined active scroll state for Google Drive-style fast scroll preview -> chunk-by-chunk sharpening
-    val isUserScrolling by remember {
-        derivedStateOf {
-            listState.isScrollInProgress || pagerState.isScrollInProgress || isZoomGestureScrolling
-        }
-    }
-
-    // Immediately hide ball when scrolling starts; only reveal ball when scrolling stops AND last scroll was upward
-    LaunchedEffect(isUserScrolling, renderEngine) {
-        renderEngine?.isUserActivelyScrolling = isUserScrolling
-        if (isUserScrolling) {
-            if (barsVisible && !isOrbMenuOpen) {
-                barsVisible = false
-            }
-        } else {
-            delay(95)
-            if (!isUserScrolling && lastPdfScrollWasUp && !barsVisible) {
-                barsVisible = true
-            }
-        }
-    }
-
-    // Fluid continuous Zoom & pan state with GPU-only graphicsLayer transforms
+    // Fluid continuous Zoom & pan state with GPU-only graphicsLayer transforms (strictly 1.0x..4.0x so unzoom never creates gaps)
     var zoomScale by remember { mutableFloatStateOf(1f) }
     var panOffsetX by remember { mutableFloatStateOf(0f) }
     var panOffsetY by remember { mutableFloatStateOf(0f) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var lastTapTime by remember { mutableLongStateOf(0L) }
-
-    // Coarse boolean thresholds prevent per-frame pinch-to-zoom recomposition of PdfViewerScreen
-    val isNativeScrollEnabled by remember { derivedStateOf { zoomScale <= 1.05f } }
-    val isZoomedOrUnzoomed by remember { derivedStateOf { abs(zoomScale - 1f) > 0.04f } }
     var settledHighZoom by remember { mutableStateOf(false) }
 
-    LaunchedEffect(isUserScrolling) {
-        if (!isUserScrolling) {
-            delay(180)
-            if (!isUserScrolling) {
-                val targetHigh = zoomScale >= 1.55f
-                if (settledHighZoom != targetHigh) {
-                    settledHighZoom = targetHigh
+    val isNativeScrollEnabled by remember {
+        derivedStateOf { zoomScale <= 1.02f }
+    }
+
+    // Observe scroll/zoom activity strictly inside a coroutine via snapshotFlow so starting/stopping scroll or pinch
+    // NEVER triggers a whole-screen recomposition of PdfViewerScreen
+    LaunchedEffect(renderEngine, viewMode, pageCount) {
+        snapshotFlow {
+            listState.isScrollInProgress || pagerState.isScrollInProgress || isZoomGestureScrolling
+        }
+            .distinctUntilChanged()
+            .collectLatest { scrolling ->
+                renderEngine?.isUserActivelyScrolling = scrolling
+                if (scrolling) {
+                    if (barsVisible && !isOrbMenuOpen) {
+                        barsVisible = false
+                    }
+                } else {
+                    if (viewMode == PdfViewMode.CONTINUOUS_FLOW && pageCount > 0) {
+                        val visibleIdx = listState.firstVisibleItemIndex
+                        if (currentPageIndex != visibleIdx) {
+                            currentPageIndex = visibleIdx
+                        }
+                    }
+                    delay(95)
+                    if (lastScrollUpRef[0] && !barsVisible) {
+                        barsVisible = true
+                    }
+                    delay(110)
+                    val targetHigh = zoomScale >= 1.55f
+                    if (settledHighZoom != targetHigh) {
+                        settledHighZoom = targetHigh
+                    }
+                    delay(260)
+                    if (renderEngine?.isUserActivelyScrolling == false) {
+                        renderEngine?.prefetchNeighborsWhenIdle(currentPageIndex)
+                    }
                 }
             }
-        }
     }
 
     var zoomAnimJob by remember { mutableStateOf<Job?>(null) }
@@ -325,7 +333,9 @@ fun PdfViewerScreen(
                 val startZoom = zoomScale
                 val startPanX = panOffsetX
                 val startPanY = panOffsetY
-                animate(0f, 1f, animationSpec = tween(175, easing = FastOutSlowInEasing)) { progress, _ ->
+                val viewH = if (containerSize.height > 0) containerSize.height.toFloat() else 1920f
+                var prevAnimatedY = 0f
+                animate(0f, 1f, animationSpec = tween(170, easing = FastOutSlowInEasing)) { progress, _ ->
                     val newZoom = startZoom + (targetZoom - startZoom) * progress
                     zoomScale = newZoom
                     if (newZoom <= 1.0f) {
@@ -333,12 +343,23 @@ fun PdfViewerScreen(
                         panOffsetY = startPanY * (1f - progress)
                     } else {
                         panOffsetX = startPanX + (targetPanX - startPanX) * progress
-                        panOffsetY = startPanY + (targetPanY - startPanY) * progress
+                        if (viewMode == PdfViewMode.CONTINUOUS_FLOW && targetZoom > startZoom && targetPanY != 0f) {
+                            val currentTargetY = targetPanY * progress
+                            val stepDeltaY = currentTargetY - prevAnimatedY
+                            prevAnimatedY = currentTargetY
+                            applyFlowVerticalDelta(stepDeltaY, newZoom, viewH)
+                        } else {
+                            panOffsetY = startPanY + (targetPanY - startPanY) * progress
+                        }
                     }
                 }
                 zoomScale = targetZoom
                 panOffsetX = if (targetZoom <= 1.0f) 0f else targetPanX
-                panOffsetY = if (targetZoom <= 1.0f) 0f else targetPanY
+                if (targetZoom <= 1.0f) {
+                    panOffsetY = 0f
+                } else if (viewMode != PdfViewMode.CONTINUOUS_FLOW || targetZoom <= startZoom) {
+                    panOffsetY = targetPanY
+                }
             } finally {
                 isZoomGestureScrolling = false
             }
@@ -465,11 +486,15 @@ fun PdfViewerScreen(
                         }
                     }
 
-                    val engine = PdfRenderEngine(targetFile, screenDensity)
+                    val engine = PdfRenderEngine(targetFile, screenDensity, perfProfile)
                     if (engine.pageCount <= 0) {
                         engine.close()
                         throw IllegalStateException("Document contains no readable pages.")
                     }
+                    // Pre-warm initial visible HD pages (0..1) and initial previews (0..N) BEFORE hiding loading screen
+                    // so the first 10 seconds of scrolling after opening a PDF are 100% lag-free
+                    engine.prewarmInitialPages()
+
                     renderEngine = engine
                     pageCount = engine.pageCount
                     currentPageIndex = 0
@@ -522,16 +547,9 @@ fun PdfViewerScreen(
         }
     }
 
-    // Only sync currentPageIndex when scrolling settles so fast scrolling triggers ZERO whole-screen recompositions
-    LaunchedEffect(listState.isScrollInProgress, viewMode, pageCount) {
-        if (viewMode == PdfViewMode.CONTINUOUS_FLOW && pageCount > 0 && !listState.isScrollInProgress) {
-            currentPageIndex = listState.firstVisibleItemIndex
-        }
-    }
-
     // Adaptive NestedScroll connection:
     // Immediately hides floating ball & chrome on ANY scroll (up or down).
-    // Tracks whether the user's scroll direction was upward so the ball only comes back up after upward scrolling stops.
+    // Tracks whether the user's scroll direction was upward in a primitive array (zero Compose state overhead).
     val nestedScrollConnection = remember {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
@@ -540,9 +558,9 @@ fun PdfViewerScreen(
                         barsVisible = false
                     }
                     if (available.y < -6f) {
-                        lastPdfScrollWasUp = false
+                        lastScrollUpRef[0] = false
                     } else if (available.y > 6f) {
-                        lastPdfScrollWasUp = true
+                        lastScrollUpRef[0] = true
                     }
                 }
                 return Offset.Zero
@@ -650,30 +668,41 @@ fun PdfViewerScreen(
 
                                     if (rawZoom > 0f && rawZoom != 1f) {
                                         val oldZoom = zoomScale
-                                        val targetZoom = (oldZoom * rawZoom).coerceIn(0.85f, 4.5f)
+                                        // Clamp minimum zoom strictly to 1.0f (100% full width) so unzooming never creates viewport gaps
+                                        val targetZoom = (oldZoom * rawZoom).coerceIn(1.0f, 4.0f)
                                         val scaleRatio = targetZoom / oldZoom
 
-                                        // Pure GPU graphicsLayer focal shift: zero LazyColumn layout passes during pinch zoom/unzoom
                                         val focusX = centroid.x - centerX
                                         val focusY = centroid.y - centerY
                                         val focalShiftX = (focusX - panOffsetX) * (1f - scaleRatio)
                                         val focalShiftY = (focusY - panOffsetY) * (1f - scaleRatio)
 
                                         zoomScale = targetZoom
-                                        if (zoomScale <= 1.0f) {
+                                        if (zoomScale <= 1.005f) {
                                             panOffsetX = 0f
                                             panOffsetY = 0f
                                         } else {
                                             val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
                                             val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
                                             panOffsetX = (panOffsetX + focalShiftX + panDelta.x).coerceIn(-maxPanX, maxPanX)
-                                            panOffsetY = (panOffsetY + focalShiftY + panDelta.y).coerceIn(-maxPanY, maxPanY)
+                                            val totalDeltaY = focalShiftY + panDelta.y
+                                            if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
+                                                applyFlowVerticalDelta(totalDeltaY, zoomScale, ch)
+                                                panOffsetY = panOffsetY.coerceIn(-maxPanY, maxPanY)
+                                            } else {
+                                                panOffsetY = (panOffsetY + totalDeltaY).coerceIn(-maxPanY, maxPanY)
+                                            }
                                         }
-                                    } else if (panDelta != Offset.Zero && zoomScale > 1.0f) {
+                                    } else if (panDelta != Offset.Zero && zoomScale > 1.005f) {
                                         val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
                                         val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
                                         panOffsetX = (panOffsetX + panDelta.x).coerceIn(-maxPanX, maxPanX)
-                                        panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
+                                        if (viewMode == PdfViewMode.CONTINUOUS_FLOW) {
+                                            applyFlowVerticalDelta(panDelta.y, zoomScale, ch)
+                                            panOffsetY = panOffsetY.coerceIn(-maxPanY, maxPanY)
+                                        } else {
+                                            panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
+                                        }
                                     }
 
                                     // Intercept and consume so underlying pager/list does not jitter during pinch
@@ -681,13 +710,13 @@ fun PdfViewerScreen(
                                 } else if (count == 1) {
                                     val change = activePointers.first()
                                     if (!isMultiTouch) {
-                                        velocityTracker.addPosition(change.uptimeMillis, change.position)
                                         val dist = (change.position - downPos).getDistance()
                                         if (dist > touchSlop) {
                                             hasMoved = true
                                         }
 
-                                        if (zoomScale > 1.05f) {
+                                        if (zoomScale > 1.02f) {
+                                            velocityTracker.addPosition(change.uptimeMillis, change.position)
                                             // ONE FINGER DRAG WHILE ZOOMED IN: Smoothly scroll and pan without multi-touch jump
                                             if (dist > touchSlop || hasMoved) {
                                                 val panDelta = event.calculatePan()
@@ -704,9 +733,9 @@ fun PdfViewerScreen(
                                                         if (panDelta.y != 0f) {
                                                             applyFlowVerticalDelta(panDelta.y, zoomScale, ch)
                                                             if (panDelta.y < -6f) {
-                                                                lastPdfScrollWasUp = false
+                                                                lastScrollUpRef[0] = false
                                                             } else if (panDelta.y > 6f) {
-                                                                lastPdfScrollWasUp = true
+                                                                lastScrollUpRef[0] = true
                                                             }
                                                         }
                                                     } else {
@@ -714,9 +743,9 @@ fun PdfViewerScreen(
                                                         val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
                                                         panOffsetY = (panOffsetY + panDelta.y).coerceIn(-maxPanY, maxPanY)
                                                         if (panDelta.y < -6f) {
-                                                            lastPdfScrollWasUp = false
+                                                            lastScrollUpRef[0] = false
                                                         } else if (panDelta.y > 6f) {
-                                                            lastPdfScrollWasUp = true
+                                                            lastScrollUpRef[0] = true
                                                         }
                                                     }
                                                 }
@@ -725,11 +754,9 @@ fun PdfViewerScreen(
                                         }
                                     } else {
                                         // Finger lifted after 2-finger pinch: consume remaining single-finger frames so page doesn't jump
-                                        if (zoomScale > 1.05f) {
-                                            change.consume()
-                                        }
+                                        change.consume()
                                     }
-                                    // When zoomScale <= 1.05f and !isMultiTouch, we DO NOT consume!
+                                    // When zoomScale <= 1.02f and !isMultiTouch, we DO NOT consume!
                                     // Native gestures scroll list or flip pages freely
                                 }
                             } while (event.changes.any { it.pressed })
@@ -768,37 +795,32 @@ fun PdfViewerScreen(
                             val maxPanX = max(0f, (cw * (zoomScale - 1f)) / 2f)
                             val maxPanY = max(0f, (ch * (zoomScale - 1f)) / 2f)
 
-                            if (zoomScale < 1.0f) {
-                                // Smoothly spring back to 1.0x fit-to-width if unzoomed below 1.0x
-                                animateZoomAndPan(1f, 0f, 0f)
-                            } else if (zoomScale > 4.5f) {
+                            if (zoomScale <= 1.02f) {
+                                zoomScale = 1f
+                                panOffsetX = 0f
+                                panOffsetY = 0f
+                            } else if (zoomScale > 4.0f) {
                                 animateZoomAndPan(
-                                    4.5f,
+                                    4.0f,
                                     panOffsetX.coerceIn(-maxPanX, maxPanX),
                                     panOffsetY.coerceIn(-maxPanY, maxPanY)
                                 )
-                            } else if (zoomScale > 1.05f) {
+                            } else {
                                 val clampedX = panOffsetX.coerceIn(-maxPanX, maxPanX)
                                 val clampedY = panOffsetY.coerceIn(-maxPanY, maxPanY)
                                 if (clampedX != panOffsetX || clampedY != panOffsetY) {
                                     animateZoomAndPan(zoomScale, clampedX, clampedY)
-                                }
-                            } else {
-                                if (panOffsetX != 0f || panOffsetY != 0f) {
-                                    panOffsetX = 0f
-                                    panOffsetY = 0f
                                 }
                             }
 
                             // Tap & Double Tap detection (fires only when stationary single touch)
                             if (!isMultiTouch && !hasMoved) {
                                 val upTime = System.currentTimeMillis()
-                                if (upTime - downTime < 320L) {
-                                    if (upTime - lastTapTime < 320L) {
-                                        // DOUBLE TAP: If zoomed in OR zoomed out, fix to 1x zoom. If at 1x, zoom into tapped spot (2.25x)
+                                if (upTime - downTime < 260L) {
+                                    if (upTime - lastTapTime < 240L) {
+                                        // DOUBLE TAP: If zoomed in, reset to 1x zoom. If at 1x, zoom into tapped spot (2.25x)
                                         lastTapTime = 0L
                                         if (abs(zoomScale - 1f) > 0.06f) {
-                                            // Fix to 1x zoom for both zoomed in and zoomed out modes!
                                             animateZoomAndPan(1f, 0f, 0f)
                                         } else {
                                             val focusX = downPos.x - centerX
@@ -817,7 +839,7 @@ fun PdfViewerScreen(
                                     } else {
                                         lastTapTime = upTime
                                         coroutineScope.launch {
-                                            delay(320L)
+                                            delay(230L)
                                             if (lastTapTime == upTime) {
                                                 lastTapTime = 0L
                                                 // SINGLE TAP: Toggle clean UI chrome or close orb menu
@@ -865,8 +887,6 @@ fun PdfViewerScreen(
                 } else {
                     // CONTINUOUS VERTICAL FLOW:
                     // Uses 100% GPU graphicsLayer for zoom/unzoom/pan so LazyColumn never relayouts during pinch gestures.
-                    // Top and bottom contentPadding match pdfCapsuleClearance so the first page starts cleanly after
-                    // the PDF name capsule and the end page has the exact same space at the bottom.
                     LazyColumn(
                         state = listState,
                         userScrollEnabled = isNativeScrollEnabled,
@@ -887,7 +907,8 @@ fun PdfViewerScreen(
                     ) {
                         items(
                             count = pageCount,
-                            key = { it }
+                            key = { it },
+                            contentType = { "pdf_page" }
                         ) { pageIdx ->
                             PdfSinglePageView(
                                 pageIndex = pageIdx,
@@ -1493,20 +1514,19 @@ fun PdfViewerScreen(
             )
         }
 
-        // INTERACTIVE ZOOM LEVEL PILL IN BOTTOM LEFT (isolated composable so pinch-to-zoom never recomposes PdfViewerScreen)
-        AnimatedVisibility(
-            visible = pageCount > 0 && !isOrbMenuOpen && isZoomedOrUnzoomed,
-            enter = fadeIn(animationSpec = tween(180)) + scaleIn(animationSpec = tween(180), transformOrigin = TransformOrigin(0f, 1f)),
-            exit = fadeOut(animationSpec = tween(180)) + scaleOut(animationSpec = tween(180), transformOrigin = TransformOrigin(0f, 1f)),
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .windowInsetsPadding(WindowInsets.navigationBars)
-                .padding(start = 18.dp, bottom = 20.dp)
-        ) {
-            PdfZoomLevelPill(
-                zoomScaleProvider = { zoomScale },
-                onResetZoom = { animateZoomAndPan(1f, 0f, 0f) }
-            )
+        // INTERACTIVE ZOOM LEVEL PILL IN BOTTOM LEFT (self-contained composable so pinch-to-zoom never recomposes PdfViewerScreen)
+        if (pageCount > 0 && !isOrbMenuOpen) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(start = 18.dp, bottom = 20.dp)
+            ) {
+                PdfZoomLevelPill(
+                    zoomScaleProvider = { zoomScale },
+                    onResetZoom = { animateZoomAndPan(1f, 0f, 0f) }
+                )
+            }
         }
 
         // MINIMALIST FLOATING CONTROL BALL (ORB) IN BOTTOM RIGHT CORNER
@@ -1622,10 +1642,15 @@ private fun PdfZoomLevelPill(
     zoomScaleProvider: () -> Float,
     onResetZoom: () -> Unit
 ) {
+    val isZoomed by remember {
+        derivedStateOf { zoomScaleProvider() > 1.03f }
+    }
+    if (!isZoomed) return
+
     // Quantize display to 5% steps via derivedStateOf so pinch-zoom only updates text when crossing 5% boundaries
     val displayPercent by remember {
         derivedStateOf {
-            ((zoomScaleProvider() * 20f).roundToInt() * 5).coerceIn(75, 450)
+            ((zoomScaleProvider() * 20f).roundToInt() * 5).coerceIn(100, 400)
         }
     }
     val isHd by remember {

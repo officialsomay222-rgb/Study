@@ -15,7 +15,7 @@ import java.io.File
 import java.io.FileOutputStream
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [36])
 class PdfLoadingRobolectricTest {
 
     private lateinit var context: Context

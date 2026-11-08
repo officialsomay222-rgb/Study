@@ -582,9 +582,9 @@ object FileImportHelper {
                 }
             }
 
-            // 3. If it has a %PDF- header, test if PdfRenderer can open it directly or if it has a valid %%EOF trailer
+            // 3. If it has a %PDF- header, check fast trailer first before opening a test PdfRenderer
             if (pdfHeaderOffset >= 0) {
-                if (canOpenWithPdfRenderer(candidatePdf) || isCompletePdfFile(candidatePdf)) {
+                if (isCompletePdfFile(candidatePdf) || canOpenWithPdfRenderer(candidatePdf)) {
                     return candidatePdf
                 }
                 // Try repairing missing %%EOF trailer
@@ -594,7 +594,7 @@ object FileImportHelper {
                     FileOutputStream(repairedFile, true).use { fos ->
                         fos.write("\n%%EOF\n".toByteArray(Charsets.US_ASCII))
                     }
-                    if (canOpenWithPdfRenderer(repairedFile) || isCompletePdfFile(repairedFile)) {
+                    if (isCompletePdfFile(repairedFile) || canOpenWithPdfRenderer(repairedFile)) {
                         return repairedFile
                     }
                 }
@@ -606,11 +606,11 @@ object FileImportHelper {
             // 4. If not a valid native PDF (or corrupted beyond trailer), check if it's an image or text/office doc
             if (context != null) {
                 convertImageToPdf(context, workingFile)?.let { imgPdf ->
-                    if (canOpenWithPdfRenderer(imgPdf) || isCompletePdfFile(imgPdf)) return imgPdf
+                    if (isCompletePdfFile(imgPdf) || canOpenWithPdfRenderer(imgPdf)) return imgPdf
                 }
 
                 val convertedDoc = DocxToPdfConverter.convertToPdf(context, workingFile, title)
-                if (canOpenWithPdfRenderer(convertedDoc) || isCompletePdfFile(convertedDoc)) {
+                if (isCompletePdfFile(convertedDoc) || canOpenWithPdfRenderer(convertedDoc)) {
                     return convertedDoc
                 }
             }
@@ -632,6 +632,17 @@ object FileImportHelper {
 
         val safeName = displayName.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
         val isWord = isWordOrOfficeDocument(displayName, mimeType, uri)
+        val finalTitle = if (displayName.endsWith(".pdf", ignoreCase = true)) {
+            displayName
+        } else {
+            displayName.removeSuffix(".docx").removeSuffix(".DOCX").removeSuffix(".doc").removeSuffix(".DOC") + ".pdf"
+        }
+
+        val uriHash = uri.toString().hashCode().toUInt().toString(16)
+        val cachedPdfFile = File(cacheFolder, "ready_${uriHash}_${safeName.removeSuffix(".pdf")}.pdf")
+        if (cachedPdfFile.exists() && cachedPdfFile.length() > 512L && isCompletePdfFile(cachedPdfFile)) {
+            return Pair(cachedPdfFile, finalTitle)
+        }
 
         val rawFileName = if (isWord) {
             if (safeName.endsWith(".docx", ignoreCase = true) || safeName.endsWith(".doc", ignoreCase = true)) {
@@ -643,7 +654,7 @@ object FileImportHelper {
             if (safeName.endsWith(".pdf", ignoreCase = true)) safeName else "$safeName.pdf"
         }
 
-        val localDest = File(cacheFolder, "imp_${System.currentTimeMillis()}_$rawFileName")
+        val localDest = File(cacheFolder, "imp_${uriHash}_$rawFileName")
 
         val copied = copyUriToLocal(context, uri, localDest, displayName)
         if (!copied || !localDest.exists() || localDest.length() == 0L) {
@@ -654,16 +665,20 @@ object FileImportHelper {
         if (isWord || isDocxZip(localDest)) {
             val convertedPdf = DocxToPdfConverter.convertToPdf(context, localDest, displayName)
             if (convertedPdf.exists() && convertedPdf.length() > 0 && canOpenWithPdfRenderer(convertedPdf)) {
-                val cleanTitle = displayName
-                    .removeSuffix(".docx").removeSuffix(".DOCX")
-                    .removeSuffix(".doc").removeSuffix(".DOC") + ".pdf"
-                return Pair(convertedPdf, cleanTitle)
+                try {
+                    convertedPdf.copyTo(cachedPdfFile, overwrite = true)
+                } catch (_: Throwable) {}
+                return Pair(if (cachedPdfFile.exists()) cachedPdfFile else convertedPdf, finalTitle)
             }
         }
 
         // Sanitize, verify, or convert to ensure PdfRenderer never fails
         val readyPdf = sanitizePdfFile(localDest, context, displayName)
-        val finalTitle = if (displayName.endsWith(".pdf", ignoreCase = true)) displayName else "$displayName.pdf"
-        return Pair(readyPdf, finalTitle)
+        if (readyPdf.absolutePath != cachedPdfFile.absolutePath && isCompletePdfFile(readyPdf)) {
+            try {
+                readyPdf.copyTo(cachedPdfFile, overwrite = true)
+            } catch (_: Throwable) {}
+        }
+        return Pair(if (cachedPdfFile.exists() && cachedPdfFile.length() > 0L) cachedPdfFile else readyPdf, finalTitle)
     }
 }

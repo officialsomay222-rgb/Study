@@ -21,11 +21,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.FitScreen
 import androidx.compose.material.icons.filled.LightMode
-import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material.icons.filled.ViewCarousel
 import androidx.compose.material.icons.filled.ViewStream
@@ -82,36 +82,34 @@ fun LiquidGlassOrbMenuCard(
     val activePageDisplay = if (isScrubbing) scrubbedPage + 1 else currentPageIndex + 1
     val zoomPercent = (zoomScale * 100).roundToInt()
 
+    val cardBgBrush = remember {
+        Brush.verticalGradient(
+            listOf(
+                Color(0xFF1B2436).copy(alpha = 0.97f),
+                Color(0xFF101726).copy(alpha = 0.99f),
+                Color(0xFF0A0F1A)
+            )
+        )
+    }
+    val cardBorderBrush = remember {
+        Brush.verticalGradient(
+            listOf(
+                Color.White.copy(alpha = 0.28f),
+                Color.White.copy(alpha = 0.08f)
+            )
+        )
+    }
+
     Surface(
         shape = RoundedCornerShape(26.dp),
         color = Color.Transparent,
-        modifier = modifier
-            .widthIn(max = 440.dp)
-            .shadow(24.dp, RoundedCornerShape(26.dp), spotColor = Color.Black.copy(alpha = 0.75f))
+        shadowElevation = 6.dp,
+        modifier = modifier.widthIn(max = 440.dp)
     ) {
         Box(
             modifier = Modifier
-                .background(
-                    Brush.verticalGradient(
-                        listOf(
-                            Color(0xFF1B2436).copy(alpha = 0.97f),
-                            Color(0xFF101726).copy(alpha = 0.99f),
-                            Color(0xFF0A0F1A)
-                        )
-                    )
-                )
-                .border(
-                    BorderStroke(
-                        1.1.dp,
-                        Brush.verticalGradient(
-                            listOf(
-                                Color.White.copy(alpha = 0.28f),
-                                Color.White.copy(alpha = 0.08f)
-                            )
-                        )
-                    ),
-                    RoundedCornerShape(26.dp)
-                )
+                .background(cardBgBrush)
+                .border(BorderStroke(1.1.dp, cardBorderBrush), RoundedCornerShape(26.dp))
                 .padding(horizontal = 16.dp, vertical = 14.dp)
                 .clickable(
                     indication = null,
@@ -261,7 +259,7 @@ fun LiquidGlassOrbMenuCard(
                         modifier = Modifier.weight(1f)
                     )
                     PdfThemeChip(
-                        icon = Icons.Default.MenuBook,
+                        icon = Icons.AutoMirrored.Filled.MenuBook,
                         label = "Sepia",
                         selected = paperTheme == PaperTheme.WARM_SEPIA,
                         onClick = {

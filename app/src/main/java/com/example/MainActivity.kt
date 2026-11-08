@@ -95,6 +95,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.core.content.ContextCompat
 import com.example.util.FileImportHelper
+import com.example.util.DevicePerformanceProfile
 import com.example.ui.pdf.DocxToPdfConverter
 import com.example.ui.pdf.LiquidGlassOrbButton
 import androidx.compose.animation.core.Spring
@@ -329,6 +330,25 @@ private fun isRunningOnVirtualizedEmulator(): Boolean {
             board.contains("cutf")
 }
 
+private fun isDirectStudyDocumentUrl(rawUrl: String): Boolean {
+    val clean = rawUrl.lowercase().trim()
+    val pathOnly = clean.substringBefore("?").substringBefore("#")
+    if (pathOnly.endsWith(".pdf") || pathOnly.endsWith(".docx") || pathOnly.endsWith(".doc")) {
+        return true
+    }
+    if ((clean.contains(".pdf") || clean.contains(".docx")) && !clean.contains(".html") && !clean.contains(".htm")) {
+        return true
+    }
+    // Direct Google Drive / Google Docs single-document links convert cleanly to PDF in FileImportHelper
+    if (clean.contains("drive.google.com/file/d/") ||
+        clean.contains("drive.google.com/uc?") ||
+        clean.contains("docs.google.com/document/d/")
+    ) {
+        return true
+    }
+    return false
+}
+
 @Composable
 fun WebViewScreen(
     url: String,
@@ -364,10 +384,22 @@ fun WebViewScreen(
     var webBallOffsetY by remember { mutableFloatStateOf(-1f) }
     var webMenuSize by remember { mutableStateOf(IntSize.Zero) }
 
-    // Only the 1st main site (study-verse-lime.vercel.app) loads in fullscreen and hides the Web Floating Ball
+    // Only our main StudyLime site loads in fullscreen and hides the Web Floating Ball;
+    // external websites open smoothly in standard browser mode (status + nav bar colored by site theme).
     val isFirstStudyLimeSite = remember(currentLoadedUrl) {
         val lower = currentLoadedUrl.lowercase().trim()
-        lower.isBlank() || lower.contains("study-verse-lime.vercel.app")
+        lower.isBlank() ||
+            lower == "about:blank" ||
+            lower.contains("study-verse-lime.vercel.app") ||
+            lower.contains("study-verse-lime") ||
+            lower.contains("studylime")
+    }
+
+    fun syncMainFrameUrl(wv: WebView?) {
+        val actualMainUrl = wv?.url?.takeIf { it.isNotBlank() && it != "about:blank" } ?: return
+        if (currentLoadedUrl != actualMainUrl) {
+            currentLoadedUrl = actualMainUrl
+        }
     }
 
     LaunchedEffect(isFirstStudyLimeSite) {
@@ -393,6 +425,7 @@ fun WebViewScreen(
                 wv.onResume()
                 (wv.parent as? View)?.visibility = View.VISIBLE
                 wv.visibility = View.VISIBLE
+                syncMainFrameUrl(wv)
             }
         } catch (_: Throwable) {
         }
@@ -594,50 +627,64 @@ fun WebViewScreen(
                 windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
             }
         } else if (webView?.canGoBack() == true) {
-            webView?.goBack()
-            canGoBack = webView?.canGoBack() == true
-            canGoForward = webView?.canGoForward() == true
+            val wv = webView
+            // Check back-forward history target immediately so returning to StudyLime restores fullscreen without delay
+            try {
+                val history = wv?.copyBackForwardList()
+                if (history != null && history.currentIndex > 0) {
+                    val prevUrl = history.getItemAtIndex(history.currentIndex - 1)?.url
+                    if (!prevUrl.isNullOrBlank() && prevUrl != "about:blank") {
+                        currentLoadedUrl = prevUrl
+                    }
+                }
+            } catch (_: Throwable) {}
+            wv?.goBack()
+            canGoBack = wv?.canGoBack() == true
+            canGoForward = wv?.canGoForward() == true
+            wv?.postDelayed({ syncMainFrameUrl(wv) }, 60)
         }
     }
 
     // Root container with dynamically updated background
     var themeColor by remember { mutableIntStateOf(android.graphics.Color.parseColor("#090D16")) }
+    val isPdfOrCustomOverlay = activePdfSource != null || customView != null
 
-        SideEffect {
-            (context as? Activity)?.window?.let { window ->
-                WindowCompat.setDecorFitsSystemWindows(window, false)
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-                    window.navigationBarDividerColor = android.graphics.Color.TRANSPARENT
-                }
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                    window.isNavigationBarContrastEnforced = false
-                    window.isStatusBarContrastEnforced = false
-                }
-                val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
-                if (activePdfSource != null || customView != null) {
-                    windowInsetsController.systemBarsBehavior =
-                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                    windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
-                } else {
-                    windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
-                }
-                @Suppress("DEPRECATION")
-                if (isInitialLink || activePdfSource != null || customView != null) {
-                    window.statusBarColor = android.graphics.Color.TRANSPARENT
-                    window.navigationBarColor = android.graphics.Color.TRANSPARENT
-                } else {
-                    window.statusBarColor = themeColor
-                    window.navigationBarColor = themeColor
-                }
-                // Dark theme (isLight == false) -> status bar text/icons are WHITE (isAppearanceLightStatusBars = false)
-                // Light theme (isLight == true) -> status bar text/icons are DARK (isAppearanceLightStatusBars = true)
-                val isLight = (android.graphics.Color.red(themeColor) * 0.299 +
-                        android.graphics.Color.green(themeColor) * 0.587 +
-                        android.graphics.Color.blue(themeColor) * 0.114) > 160
-                windowInsetsController.isAppearanceLightStatusBars = isLight
-                windowInsetsController.isAppearanceLightNavigationBars = isLight
+    // Update WindowInsets & SystemBar colors ONLY when fullscreen mode or themeColor actually changes (zero per-frame IPC lag)
+    LaunchedEffect(isInitialLink, isPdfOrCustomOverlay, themeColor) {
+        (context as? Activity)?.window?.let { window ->
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                window.navigationBarDividerColor = android.graphics.Color.TRANSPARENT
             }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+                window.isStatusBarContrastEnforced = false
+            }
+            val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
+            if (isPdfOrCustomOverlay) {
+                windowInsetsController.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
+            } else {
+                windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
+            }
+            @Suppress("DEPRECATION")
+            if (isInitialLink || isPdfOrCustomOverlay) {
+                window.statusBarColor = android.graphics.Color.TRANSPARENT
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
+            } else {
+                window.statusBarColor = themeColor
+                window.navigationBarColor = themeColor
+            }
+            // Dark theme (isLight == false) -> status bar text/icons are WHITE (isAppearanceLightStatusBars = false)
+            // Light theme (isLight == true) -> status bar text/icons are DARK (isAppearanceLightStatusBars = true)
+            val isLight = (android.graphics.Color.red(themeColor) * 0.299 +
+                    android.graphics.Color.green(themeColor) * 0.587 +
+                    android.graphics.Color.blue(themeColor) * 0.114) > 160
+            windowInsetsController.isAppearanceLightStatusBars = isLight
+            windowInsetsController.isAppearanceLightNavigationBars = isLight
         }
+    }
 
         Box(
             modifier = Modifier
@@ -925,6 +972,8 @@ fun WebViewScreen(
                         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
 
                         setDownloadListener { downloadUrl, userAgent, contentDisposition, mimeType, contentLength ->
+                            // Ensure main frame URL stays synced to the actual displayed page (e.g. StudyLime fullscreen)
+                            syncMainFrameUrl(this)
                             var rawFileName = URLUtil.guessFileName(downloadUrl, contentDisposition, mimeType)
                             val isWordDoc = DocxToPdfConverter.isWordOrOfficeDocument(rawFileName, mimeType) ||
                                             downloadUrl.contains(".docx", ignoreCase = true) ||
@@ -1067,11 +1116,7 @@ fun WebViewScreen(
                                 newWebView.webChromeClient = this
                                 newWebView.webViewClient = object : WebViewClient() {
                                     private fun handlePopupUrl(v: WebView?, targetUrl: String): Boolean {
-                                        val isDoc = targetUrl.endsWith(".pdf", ignoreCase = true) ||
-                                            targetUrl.endsWith(".docx", ignoreCase = true) ||
-                                            targetUrl.endsWith(".doc", ignoreCase = true) ||
-                                            (targetUrl.contains(".pdf", ignoreCase = true) && !targetUrl.contains("html")) ||
-                                            (targetUrl.contains(".docx", ignoreCase = true) && !targetUrl.contains("html"))
+                                        val isDoc = isDirectStudyDocumentUrl(targetUrl)
                                         if (isDoc) {
                                             (ctx as? Activity)?.runOnUiThread {
                                                 if (activePdfSource == null) {
@@ -1083,9 +1128,11 @@ fun WebViewScreen(
                                                     )
                                                 }
                                             }
+                                            syncMainFrameUrl(view)
                                         } else {
                                             if (activePdfSource == null) {
-                                                currentLoadedUrl = targetUrl
+                                                // Do NOT prematurely overwrite currentLoadedUrl before view commits the new page;
+                                                // if targetUrl is a download or external intent, StudyLime remains in fullscreen.
                                                 view.loadUrl(targetUrl)
                                             }
                                         }
@@ -1168,15 +1215,8 @@ fun WebViewScreen(
                                 if (activePdfSource != null) {
                                     return true
                                 }
-                                if (request.isForMainFrame) {
-                                    currentLoadedUrl = requestUrl
-                                }
 
-                                val isDocument = requestUrl.endsWith(".pdf", ignoreCase = true) || 
-                                                     requestUrl.endsWith(".docx", ignoreCase = true) ||
-                                                     requestUrl.endsWith(".doc", ignoreCase = true) ||
-                                                     (requestUrl.contains(".pdf", ignoreCase = true) && !requestUrl.contains("html")) ||
-                                                     (requestUrl.contains(".docx", ignoreCase = true) && !requestUrl.contains("html"))
+                                val isDocument = isDirectStudyDocumentUrl(requestUrl)
 
                                 if (isDocument) {
                                     val guessName = URLUtil.guessFileName(requestUrl, null, if (requestUrl.contains(".doc")) "application/msword" else "application/pdf")
@@ -1187,11 +1227,12 @@ fun WebViewScreen(
                                         }
                                     }
                                     view?.stopLoading()
+                                    syncMainFrameUrl(view)
                                     return true
                                 }
 
                                 if (requestUrl.startsWith("http://") || requestUrl.startsWith("https://")) {
-                                    return false // Let WebView handle it normally
+                                    return false // Let WebView handle it; currentLoadedUrl updates in onPageCommitVisible / doUpdateVisitedHistory
                                 }
                                 try {
                                     val intent = if (requestUrl.startsWith("intent://")) {
@@ -1223,6 +1264,7 @@ fun WebViewScreen(
                                     }
                                     e.printStackTrace()
                                 }
+                                syncMainFrameUrl(view)
                                 return true
                             }
 
@@ -1232,13 +1274,8 @@ fun WebViewScreen(
                                 if (activePdfSource != null) {
                                     return true
                                 }
-                                currentLoadedUrl = urlStr
 
-                                val isDocStr = urlStr.endsWith(".pdf", ignoreCase = true) || 
-                                               urlStr.endsWith(".docx", ignoreCase = true) ||
-                                               urlStr.endsWith(".doc", ignoreCase = true) ||
-                                               (urlStr.contains(".pdf", ignoreCase = true) && !urlStr.contains("html")) ||
-                                               (urlStr.contains(".docx", ignoreCase = true) && !urlStr.contains("html"))
+                                val isDocStr = isDirectStudyDocumentUrl(urlStr)
 
                                 if (isDocStr) {
                                     val guessName = URLUtil.guessFileName(urlStr, null, if (urlStr.contains(".doc")) "application/msword" else "application/pdf")
@@ -1249,6 +1286,7 @@ fun WebViewScreen(
                                         }
                                     }
                                     view?.stopLoading()
+                                    syncMainFrameUrl(view)
                                     return true
                                 }
 
@@ -1285,6 +1323,7 @@ fun WebViewScreen(
                                     }
                                     e.printStackTrace()
                                 }
+                                syncMainFrameUrl(view)
                                 return true
                             }
 
@@ -1292,9 +1331,9 @@ fun WebViewScreen(
                                 super.doUpdateVisitedHistory(view, url, isReload)
                                 canGoBack = view?.canGoBack() == true
                                 canGoForward = view?.canGoForward() == true
-                                if (url != null) currentLoadedUrl = url
+                                syncMainFrameUrl(view)
                                 view?.let { webView ->
-                                    applyDynamicSettings(url, webView)
+                                    applyDynamicSettings(webView.url ?: url, webView)
                                 }
                             }
 
@@ -1404,22 +1443,21 @@ fun WebViewScreen(
                                         sendColor();
                                         if (!window.__studyverse_theme_observer_installed) {
                                             window.__studyverse_theme_observer_installed = true;
-                                            var observer = new MutationObserver(function() {
-                                                sendColor();
-                                            });
+                                            var themeTimer = null;
+                                            function scheduleSendColor() {
+                                                if (themeTimer) clearTimeout(themeTimer);
+                                                themeTimer = setTimeout(sendColor, 180);
+                                            }
+                                            var observer = new MutationObserver(scheduleSendColor);
                                             if (document.head) {
                                                 observer.observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['content'] });
                                             }
                                             if (document.documentElement) {
-                                                observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class', 'data-theme', 'data-mode', 'data-color-scheme'] });
+                                                observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme', 'data-mode', 'data-color-scheme'] });
                                             }
                                             if (document.body) {
-                                                observer.observe(document.body, { attributes: true, attributeFilter: ['style', 'class', 'data-theme', 'data-mode', 'data-color-scheme'] });
+                                                observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme', 'data-mode', 'data-color-scheme'] });
                                             }
-                                            window.addEventListener('click', function() {
-                                                setTimeout(sendColor, 60);
-                                                setTimeout(sendColor, 240);
-                                            }, { passive: true });
                                         }
                                     })();
                                 """.trimIndent(), null)
@@ -1428,6 +1466,12 @@ fun WebViewScreen(
                             private fun installScrollAndSafetyGuard(view: WebView?) {
                                 val scrollGuardScript = """
                                     (function() {
+                                        if (!document.getElementById('__studyverse_fast_tap') && document.head) {
+                                            var st = document.createElement('style');
+                                            st.id = '__studyverse_fast_tap';
+                                            st.textContent = 'button, a, [role="button"], input, select, textarea, label, summary { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }';
+                                            document.head.appendChild(st);
+                                        }
                                         if (!window.__studyverse_safety_guard_installed) {
                                             window.__studyverse_safety_guard_installed = true;
                                             window.addEventListener('error', function(e) {
@@ -1470,7 +1514,7 @@ fun WebViewScreen(
                                                 return false;
                                             }
 
-                                            // Zero-JNI during active scrolling: only report state once scrolling settles
+                                            // Zero-JNI during active scrolling or button taps: only report state once scrolling settles
                                             function onScrollCapture(e) {
                                                 var t = e ? e.target : null;
                                                 if (t && t !== document && t !== window && t.scrollTop !== undefined) {
@@ -1485,22 +1529,10 @@ fun WebViewScreen(
                                                             window.AndroidApp.reportScrollState(scrolled);
                                                         }
                                                     }
-                                                }, 180);
-                                            }
-
-                                            function onTouchStartCapture(e) {
-                                                var t = e ? e.target : null;
-                                                var scrolled = checkAnyScrolledFast(t);
-                                                if (scrolled !== lastReportedScrolled) {
-                                                    lastReportedScrolled = scrolled;
-                                                    if (window.AndroidApp && window.AndroidApp.reportScrollState) {
-                                                        window.AndroidApp.reportScrollState(scrolled);
-                                                    }
-                                                }
+                                                }, 200);
                                             }
 
                                             window.addEventListener('scroll', onScrollCapture, { capture: true, passive: true });
-                                            window.addEventListener('touchstart', onTouchStartCapture, { capture: true, passive: true });
                                         }
                                     })();
                                 """.trimIndent()
@@ -1512,10 +1544,9 @@ fun WebViewScreen(
                                 isLoading = true
                                 progress = 0f
                                 scrollGuard.isWebPageScrolledDown = false
-                                if (url != null) currentLoadedUrl = url
                                 
                                 view?.let { webView ->
-                                    applyDynamicSettings(url, webView)
+                                    applyDynamicSettings(webView.url ?: url, webView)
                                 }
 
                                 installScrollAndSafetyGuard(view)
@@ -1523,7 +1554,7 @@ fun WebViewScreen(
 
                             override fun onPageCommitVisible(view: WebView?, url: String?) {
                                 super.onPageCommitVisible(view, url)
-                                if (url != null) currentLoadedUrl = url
+                                syncMainFrameUrl(view)
                                 extractAndPostThemeColor(view)
                             }
 
@@ -1533,20 +1564,22 @@ fun WebViewScreen(
                                 swipeRefreshLayout.isRefreshing = false
                                 canGoBack = view?.canGoBack() == true
                                 canGoForward = view?.canGoForward() == true
-                                if (url != null) currentLoadedUrl = url
+                                syncMainFrameUrl(view)
                                 installScrollAndSafetyGuard(view)
                                 extractAndPostThemeColor(view)
 
-                                // White screen / React blank body crash safety check after 1.5s
+                                // Safe blank body check strictly for StudyLime main site after full hydration (3.5s)
                                 view?.postDelayed({
-                                    if (!hasError && !isLoading && activePdfSource == null) {
+                                    val currentHost = view.url?.lowercase() ?: ""
+                                    if (!hasError && !isLoading && activePdfSource == null && currentHost.contains("study-verse-lime.vercel.app")) {
                                         view.evaluateJavascript("""
                                             (function() {
+                                                if (document.readyState !== 'complete') return 'LOADING';
                                                 var body = document.body;
                                                 if (!body) return 'BLANK';
                                                 var text = (body.innerText || '').trim();
                                                 var elems = body.children.length;
-                                                if (elems === 0 || (text.length === 0 && body.querySelectorAll('img, svg, canvas, iframe, button, a').length === 0)) {
+                                                if (elems === 0 || (text.length === 0 && body.querySelectorAll('img, svg, canvas, iframe, video, button, a, input').length === 0)) {
                                                     return 'BLANK';
                                                 }
                                                 return 'OK';
@@ -1557,7 +1590,7 @@ fun WebViewScreen(
                                             }
                                         }
                                     }
-                                }, 1500)
+                                }, 3500)
                             }
 
                             override fun onReceivedHttpError(
@@ -1799,62 +1832,45 @@ fun WebViewScreen(
                 val defaultBallX = maxBallX
                 val defaultBallY = (maxBallY - with(density) { 4.dp.toPx() }).coerceIn(minBallY, maxBallY)
 
-                val currentBallX = if (webBallOffsetX < 0f) defaultBallX else webBallOffsetX.coerceIn(minBallX, maxBallX)
-                val currentBallY = if (webBallOffsetY < 0f) defaultBallY else webBallOffsetY.coerceIn(minBallY, maxBallY)
-
                 val fallbackMenuW = with(density) { 316.dp.toPx() }
                 val fallbackMenuH = with(density) { 210.dp.toPx() }
                 val menuW = (if (webMenuSize.width > 0) webMenuSize.width.toFloat() else fallbackMenuW)
                     .coerceAtMost((screenW - edgeMarginPx * 2f).coerceAtLeast(180f))
                 val menuH = if (webMenuSize.height > 0) webMenuSize.height.toFloat() else fallbackMenuH
 
-                val ballCenterX = currentBallX + ballSizePx / 2f
-                val spaceAbove = currentBallY - minBallY
-                val spaceBelow = (screenH - bottomInsetPx - edgeMarginPx) - (currentBallY + ballSizePx)
-                val openAbove = spaceAbove >= menuH + menuGapPx || spaceAbove >= spaceBelow
-
-                val minMenuX = edgeMarginPx
-                val maxMenuX = (screenW - edgeMarginPx - menuW).coerceAtLeast(minMenuX)
-                val rawMenuX = when {
-                    ballCenterX < screenW * 0.38f -> currentBallX
-                    ballCenterX > screenW * 0.62f -> currentBallX + ballSizePx - menuW
-                    else -> ballCenterX - menuW / 2f
-                }
-                val resolvedMenuX = rawMenuX.coerceIn(minMenuX, maxMenuX)
-
-                val minMenuY = minBallY
-                val maxMenuY = (screenH - bottomInsetPx - edgeMarginPx - menuH).coerceAtLeast(minMenuY)
-                val rawMenuY = if (openAbove) {
-                    currentBallY - menuH - menuGapPx
-                } else {
-                    currentBallY + ballSizePx + menuGapPx
-                }
-                val resolvedMenuY = rawMenuY.coerceIn(minMenuY, maxMenuY)
-
-                val pivotX = ((ballCenterX - resolvedMenuX) / menuW.coerceAtLeast(1f)).coerceIn(0.08f, 0.92f)
-                val pivotY = if (openAbove) 1f else 0f
-
                 // Expanded Chrome-Style Quick Menu positioned dynamically around the Movable Ball
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .offset {
-                            IntOffset(resolvedMenuX.roundToInt(), resolvedMenuY.roundToInt())
-                        }
-                ) {
-                    AnimatedVisibility(
-                        visible = isWebOrbMenuOpen,
-                        enter = fadeIn(animationSpec = tween(160)) + scaleIn(
-                            animationSpec = spring(
-                                dampingRatio = Spring.DampingRatioNoBouncy,
-                                stiffness = Spring.StiffnessMedium
-                            ),
-                            transformOrigin = TransformOrigin(pivotX, pivotY)
-                        ),
-                        exit = fadeOut(animationSpec = tween(140)) + scaleOut(
-                            animationSpec = tween(140),
-                            transformOrigin = TransformOrigin(pivotX, pivotY)
-                        )
+                if (isWebOrbMenuOpen) {
+                    val currentBallX = if (webBallOffsetX < 0f) defaultBallX else webBallOffsetX.coerceIn(minBallX, maxBallX)
+                    val currentBallY = if (webBallOffsetY < 0f) defaultBallY else webBallOffsetY.coerceIn(minBallY, maxBallY)
+                    val ballCenterX = currentBallX + ballSizePx / 2f
+                    val spaceAbove = currentBallY - minBallY
+                    val spaceBelow = (screenH - bottomInsetPx - edgeMarginPx) - (currentBallY + ballSizePx)
+                    val openAbove = spaceAbove >= menuH + menuGapPx || spaceAbove >= spaceBelow
+
+                    val minMenuX = edgeMarginPx
+                    val maxMenuX = (screenW - edgeMarginPx - menuW).coerceAtLeast(minMenuX)
+                    val rawMenuX = when {
+                        ballCenterX < screenW * 0.38f -> currentBallX
+                        ballCenterX > screenW * 0.62f -> currentBallX + ballSizePx - menuW
+                        else -> ballCenterX - menuW / 2f
+                    }
+                    val resolvedMenuX = rawMenuX.coerceIn(minMenuX, maxMenuX)
+
+                    val minMenuY = minBallY
+                    val maxMenuY = (screenH - bottomInsetPx - edgeMarginPx - menuH).coerceAtLeast(minMenuY)
+                    val rawMenuY = if (openAbove) {
+                        currentBallY - menuH - menuGapPx
+                    } else {
+                        currentBallY + ballSizePx + menuGapPx
+                    }
+                    val resolvedMenuY = rawMenuY.coerceIn(minMenuY, maxMenuY)
+
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .offset {
+                                IntOffset(resolvedMenuX.roundToInt(), resolvedMenuY.roundToInt())
+                            }
                     ) {
                         WebFloatingBallChromeMenu(
                             canGoBack = canGoBack,
@@ -1876,18 +1892,31 @@ fun WebViewScreen(
                                 webView?.reload()
                             },
                             onGoBack = {
-                                if (webView?.canGoBack() == true) {
-                                    webView?.goBack()
-                                    canGoBack = webView?.canGoBack() == true
-                                    canGoForward = webView?.canGoForward() == true
+                                val wv = webView
+                                if (wv?.canGoBack() == true) {
+                                    try {
+                                        val history = wv.copyBackForwardList()
+                                        if (history.currentIndex > 0) {
+                                            val prevUrl = history.getItemAtIndex(history.currentIndex - 1)?.url
+                                            if (!prevUrl.isNullOrBlank() && prevUrl != "about:blank") {
+                                                currentLoadedUrl = prevUrl
+                                            }
+                                        }
+                                    } catch (_: Throwable) {}
+                                    wv.goBack()
+                                    canGoBack = wv.canGoBack()
+                                    canGoForward = wv.canGoForward()
+                                    wv.postDelayed({ syncMainFrameUrl(wv) }, 60)
                                 }
                                 isWebOrbMenuOpen = false
                             },
                             onGoForward = {
-                                if (webView?.canGoForward() == true) {
-                                    webView?.goForward()
-                                    canGoBack = webView?.canGoBack() == true
-                                    canGoForward = webView?.canGoForward() == true
+                                val wv = webView
+                                if (wv?.canGoForward() == true) {
+                                    wv.goForward()
+                                    canGoBack = wv.canGoBack()
+                                    canGoForward = wv.canGoForward()
+                                    wv.postDelayed({ syncMainFrameUrl(wv) }, 60)
                                 }
                                 isWebOrbMenuOpen = false
                             },
@@ -1919,12 +1948,14 @@ fun WebViewScreen(
                     }
                 }
 
-                // Always-Visible Movable Web Browsing Ball (Drag freely anywhere on screen; tap to open menu)
+                // Always-Visible Movable Web Browsing Ball (Reads webBallOffsetX/Y strictly inside layout offset lambda for 0 recompositions on drag)
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .offset {
-                            IntOffset(currentBallX.roundToInt(), currentBallY.roundToInt())
+                            val bx = if (webBallOffsetX < 0f) defaultBallX else webBallOffsetX.coerceIn(minBallX, maxBallX)
+                            val by = if (webBallOffsetY < 0f) defaultBallY else webBallOffsetY.coerceIn(minBallY, maxBallY)
+                            IntOffset(bx.roundToInt(), by.roundToInt())
                         }
                         .pointerInput(minBallX, maxBallX, minBallY, maxBallY) {
                             detectDragGestures { change, dragAmount ->
@@ -1984,6 +2015,8 @@ fun WebViewScreen(
 
 @Composable
 fun LoadingOverlay(progress: Float) {
+    val context = LocalContext.current
+    val perfProfile = remember { DevicePerformanceProfile.get(context) }
     val infiniteTransition = rememberInfiniteTransition(label = "RealisticAuraLoader")
 
     // Smooth atmospheric aura & silk wave phase
@@ -2146,7 +2179,7 @@ fun LoadingOverlay(progress: Float) {
             )
 
             // Volumetric Top Aurora Silk Curtains
-            val step = (width / 28f).coerceAtLeast(14f)
+            val step = (width / perfProfile.waveStepDivisor).coerceAtLeast(14f)
             topCurtainPath1.rewind()
             topCurtainPath1.moveTo(0f, 0f)
             topCurtainPath1.lineTo(0f, height * 0.28f)
@@ -2246,8 +2279,8 @@ fun LoadingOverlay(progress: Float) {
                 style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
             )
 
-            // Ascending & Orbiting Luminous Photon Particles (24 depth-of-field light orbs)
-            for (i in 0 until 24) {
+            // Ascending & Orbiting Luminous Photon Particles (device-adaptive count)
+            for (i in 0 until perfProfile.auraParticleCount) {
                 val seed = i * 83.7f
                 val horizontalWave = sin(auraPhase + i * 0.6f) * 32f
                 val sx = ((sin(seed) * 0.5f + 0.5f) * width + horizontalWave + width) % width
@@ -2363,7 +2396,7 @@ fun LoadingOverlay(progress: Float) {
                         val tiltAngle = if (g == 0) primaryOrbitAngle + 28f else counterOrbitAngle - 32f
                         val rx = maxR * 0.94f
                         val ry = maxR * 0.36f
-                        val numSegments = 36
+                        val numSegments = perfProfile.gyroRingSegments
                         for (s in 0 until numSegments) {
                             val a1 = (s * (360f / numSegments)) * (PI / 180.0)
                             val a2 = ((s + 1) * (360f / numSegments)) * (PI / 180.0)

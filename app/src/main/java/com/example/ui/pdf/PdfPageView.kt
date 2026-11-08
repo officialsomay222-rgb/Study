@@ -2,8 +2,11 @@ package com.example.ui.pdf
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -21,14 +24,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 /**
- * Ultra-Fast Single-Quad PDF Page Renderer optimized for budget & mid-range GPUs (e.g. Exynos 850 / Mali-G52):
- * - Uses exact pre-computed page aspect ratio from frame 0 so LazyColumn never experiences layout height jumps.
- * - Never downgrades an already-cached sharp page during scrolling or zooming (zero texture thrashing).
- * - Uses a 1-frame (18ms) fast-fling gate when uncached so pages flying past during a fast fling
- *   consume 0% CPU/GPU and never touch PdfRenderer.
- * - Renders directly as a rectangular hardware quad without offscreen rounded-corner clip buffers.
+ * Ultra-Fast Single-Quad PDF Page Renderer optimized for budget & mid-range GPUs (e.g. Samsung F13 / Exynos 850):
+ * - Skips creating a [LaunchedEffect] coroutine entirely when the page's sharp bitmap is already in cache.
+ * - Uses strict native page aspect ratio [PdfRenderEngine.getPageAspectRatio] and [ContentScale.FillBounds]
+ *   so page height never shifts by even 1px and never creates gaps when unzooming or switching from preview to HD.
+ * - Defers uncached bitmap allocation & GPU texture uploads while [PdfRenderEngine.isUserActivelyScrolling] is true,
+ *   so fast swipe-flings glide at 60/120fps with zero mid-fling GPU stalls.
  */
 @Composable
 fun PdfSinglePageView(
@@ -50,57 +54,80 @@ fun PdfSinglePageView(
         )
     }
 
-    LaunchedEffect(pageIndex, engine, isHighZoom) {
-        // 1. Check synchronous cache first
-        val immediateSharp = engine.getCachedSharpImage(pageIndex, ultraHd = isHighZoom)
-        if (immediateSharp != null) {
-            sharpImage = immediateSharp
-            return@LaunchedEffect
-        }
-        if (sharpImage == null) {
-            engine.getCachedSharpImage(pageIndex, ultraHd = false)?.let {
-                sharpImage = it
-            }
-        }
+    val needsBackgroundRender = sharpImage == null || (isHighZoom && !engine.hasCachedUltraHd(pageIndex))
 
-        // 2. Load lightweight preview if no image is available yet
-        if (sharpImage == null && previewImage == null) {
-            val cachedPrev = engine.getCachedPreviewImage(pageIndex)
-            if (cachedPrev != null) {
-                previewImage = cachedPrev
-            } else {
-                // During a fast fling, wait 1 frame (18ms) so pages flying past are disposed before touching PdfRenderer
-                if (engine.isUserActivelyScrolling) {
-                    delay(18)
+    if (needsBackgroundRender) {
+        LaunchedEffect(pageIndex, engine, isHighZoom) {
+            // 1. Check synchronous cache first (0ms fast path)
+            val immediateTarget = engine.getCachedSharpImage(pageIndex, ultraHd = isHighZoom)
+            if (immediateTarget != null) {
+                sharpImage = immediateTarget
+                return@LaunchedEffect
+            }
+            if (sharpImage == null) {
+                engine.getCachedSharpImage(pageIndex, ultraHd = false)?.let {
+                    sharpImage = it
                 }
+            }
+
+            // 2. Load lightweight preview if no image is available yet
+            while (isActive && sharpImage == null && previewImage == null) {
+                val cachedPrev = engine.getCachedPreviewImage(pageIndex)
+                if (cachedPrev != null) {
+                    previewImage = cachedPrev
+                    break
+                }
+                // Wait while user is actively flinging so pages flying past never upload GPU textures mid-fling
+                while (isActive && engine.isUserActivelyScrolling) {
+                    delay(engine.flingGateDelayMs)
+                }
+                if (!isActive) break
                 val renderedPrev = engine.getPreviewImage(pageIndex)
                 if (renderedPrev != null) {
                     previewImage = renderedPrev
+                    break
                 }
+                delay(50L)
             }
-        }
 
-        // 3. Wait until active scrolling/zooming settles before rendering full HD / Ultra-HD bitmap
-        while (engine.isUserActivelyScrolling) {
-            delay(65)
-        }
-        delay(65)
-        while (engine.isUserActivelyScrolling) {
-            delay(65)
-        }
+            // 3. Wait for continuous stillness (settleDelayMs + stagger) and retry if interrupted by a scroll
+            // so visible pages ALWAYS reach crisp HD / Ultra-HD once the user stops scrolling.
+            val requiredStillMs = engine.settleDelayMs + (pageIndex % 2) * 55L
+            while (isActive) {
+                val cachedSharp = engine.getCachedSharpImage(pageIndex, ultraHd = isHighZoom)
+                if (cachedSharp != null) {
+                    sharpImage = cachedSharp
+                    break
+                }
 
-        val renderedSharp = engine.getPageImage(pageIndex, ultraHd = isHighZoom)
-        if (renderedSharp != null) {
-            sharpImage = renderedSharp
+                var quietElapsed = 0L
+                while (isActive && quietElapsed < requiredStillMs) {
+                    if (engine.isUserActivelyScrolling) {
+                        quietElapsed = 0L
+                        delay(65L)
+                    } else {
+                        delay(65L)
+                        if (!engine.isUserActivelyScrolling) {
+                            quietElapsed += 65L
+                        } else {
+                            quietElapsed = 0L
+                        }
+                    }
+                }
+
+                if (!isActive) break
+                val renderedSharp = engine.getPageImage(pageIndex, ultraHd = isHighZoom)
+                if (renderedSharp != null) {
+                    sharpImage = renderedSharp
+                    break
+                }
+                delay(75L)
+            }
         }
     }
 
     val displayImage = sharpImage ?: previewImage
-    val aspect = if (displayImage != null && displayImage.height > 0) {
-        (displayImage.width.toFloat() / displayImage.height.toFloat()).coerceIn(0.2f, 5.0f)
-    } else {
-        engine.getPageAspectRatio(pageIndex)
-    }
+    val aspect = engine.getPageAspectRatio(pageIndex)
 
     Box(
         modifier = modifier,
@@ -117,31 +144,20 @@ fun PdfSinglePageView(
                 Image(
                     bitmap = displayImage,
                     contentDescription = "Page ${pageIndex + 1}",
-                    contentScale = ContentScale.FillWidth,
+                    contentScale = ContentScale.FillBounds,
                     colorFilter = colorFilter,
-                    filterQuality = if (displayImage === previewImage) FilterQuality.Low else FilterQuality.Medium,
+                    filterQuality = FilterQuality.Low,
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.padding(24.dp)
-                ) {
-                    CircularProgressIndicator(
-                        color = Color(0xFF00E5FF),
-                        strokeWidth = 2.5.dp,
-                        modifier = Modifier.size(26.dp)
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Page ${pageIndex + 1}",
-                        color = Color(0xFF90CAF9),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium
-                    )
-                }
+                Text(
+                    text = "Page ${pageIndex + 1}",
+                    color = Color(0xFF64748B),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.padding(16.dp)
+                )
             }
         }
     }
 }
-

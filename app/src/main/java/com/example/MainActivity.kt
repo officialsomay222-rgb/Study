@@ -28,6 +28,9 @@ import com.example.ui.pdf.LiquidGlassButton
 import com.example.ui.offline.OfflineHubScreen
 import com.example.util.NetworkMonitor
 import com.google.firebase.Firebase
+import com.google.firebase.remoteconfig.ConfigUpdate
+import com.google.firebase.remoteconfig.ConfigUpdateListener
+import com.google.firebase.remoteconfig.FirebaseRemoteConfigException
 import com.google.firebase.remoteconfig.remoteConfig
 import com.google.firebase.remoteconfig.remoteConfigSettings
 import androidx.activity.ComponentActivity
@@ -130,6 +133,7 @@ class MainActivity : ComponentActivity() {
     private var webViewInstance: WebView? = null
     private var incomingPdfUri by mutableStateOf<Uri?>(null)
     private var incomingPdfName by mutableStateOf<String?>(null)
+    private var incomingWebUrl by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -152,9 +156,13 @@ class MainActivity : ComponentActivity() {
                     savedState = savedInstanceState,
                     initialPdfUri = incomingPdfUri,
                     initialPdfTitle = incomingPdfName,
+                    initialWebUrl = incomingWebUrl,
                     onClearIncomingPdf = {
                         incomingPdfUri = null
                         incomingPdfName = null
+                    },
+                    onClearIncomingWebUrl = {
+                        incomingWebUrl = null
                     },
                     onWebViewCreated = { webViewInstance = it }
                 )
@@ -171,6 +179,34 @@ class MainActivity : ComponentActivity() {
     private fun handleIntent(intent: Intent?) {
         if (intent == null) return
         try {
+            // 1. Handle URL shared from Chrome ("Share -> StudyVerse") so any key-activation or study link opens inside the app
+            if (intent.action == Intent.ACTION_SEND && intent.type?.startsWith("text/plain", ignoreCase = true) == true) {
+                val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
+                val extractedUrl = Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE).find(sharedText)?.value
+                if (!extractedUrl.isNullOrBlank()) {
+                    if (isDirectStudyDocumentUrl(extractedUrl)) {
+                        incomingPdfUri = Uri.parse(extractedUrl)
+                        incomingPdfName = URLUtil.guessFileName(extractedUrl, null, "application/pdf")
+                    } else {
+                        incomingWebUrl = extractedUrl
+                    }
+                    return
+                }
+            }
+
+            // 2. Handle direct HTTP/HTTPS deep links (e.g. StudyLime key activation callback)
+            val dataUri = intent.data
+            val scheme = dataUri?.scheme?.lowercase()
+            val mime = intent.type?.lowercase() ?: ""
+            if (intent.action == Intent.ACTION_VIEW && dataUri != null && (scheme == "http" || scheme == "https")) {
+                val rawWebUrl = dataUri.toString()
+                val isPdfOrDocMime = mime.contains("pdf") || mime.contains("word") || mime.contains("officedocument")
+                if (!isPdfOrDocMime && !isDirectStudyDocumentUrl(rawWebUrl)) {
+                    incomingWebUrl = rawWebUrl
+                    return
+                }
+            }
+
             val uri = FileImportHelper.extractUriFromIntent(intent) ?: return
 
             // Take persistable permission if available
@@ -349,13 +385,129 @@ private fun isDirectStudyDocumentUrl(rawUrl: String): Boolean {
     return false
 }
 
+/**
+ * Unwraps Chrome redirect links (`intent://...#Intent;scheme=https;package=com.android.chrome;end`,
+ * `googlechrome://navigate?url=...`, `googlechromes://...`) into standard `https://` or `http://` URLs
+ * so ad-key generators and study shorteners stay inside the app's WebView session and auto-activate keys in-app.
+ * Returns null if the link is for a non-browser native app (e.g., Telegram `tg://`, WhatsApp `whatsapp://`, UPI `upi://`).
+ */
+private fun resolveWebUrlFromIntentOrCustomScheme(rawUrl: String): String? {
+    val trimmed = rawUrl.trim()
+    val lower = trimmed.lowercase()
+
+    if (lower.startsWith("googlechrome://navigate?url=")) {
+        val extracted = trimmed.substring("googlechrome://navigate?url=".length)
+        val decoded = try { java.net.URLDecoder.decode(extracted, "UTF-8") } catch (_: Throwable) { extracted }
+        if (decoded.startsWith("http://", ignoreCase = true) || decoded.startsWith("https://", ignoreCase = true)) {
+            return decoded
+        }
+    }
+    if (lower.startsWith("googlechromes://")) {
+        val rest = trimmed.substring("googlechromes://".length).removePrefix("navigate?url=")
+        return if (rest.startsWith("http://", ignoreCase = true) || rest.startsWith("https://", ignoreCase = true)) rest else "https://$rest"
+    }
+    if (lower.startsWith("googlechrome://")) {
+        val rest = trimmed.substring("googlechrome://".length).removePrefix("navigate?url=")
+        if (rest.isNotBlank()) {
+            return if (rest.startsWith("http://", ignoreCase = true) || rest.startsWith("https://", ignoreCase = true)) rest else "https://$rest"
+        }
+    }
+
+    if (lower.startsWith("intent://") || lower.startsWith("intent:")) {
+        try {
+            val parsedIntent = Intent.parseUri(trimmed, Intent.URI_INTENT_SCHEME)
+            val dataStr = parsedIntent.dataString
+            if (!dataStr.isNullOrBlank()) {
+                if (dataStr.startsWith("http://", ignoreCase = true) || dataStr.startsWith("https://", ignoreCase = true)) {
+                    return dataStr
+                }
+                if (dataStr.startsWith("googlechrome://", ignoreCase = true) || dataStr.startsWith("googlechromes://", ignoreCase = true)) {
+                    resolveWebUrlFromIntentOrCustomScheme(dataStr)?.let { return it }
+                }
+            }
+            val fallbackUrl = parsedIntent.getStringExtra("browser_fallback_url")
+                ?: parsedIntent.getStringExtra("S.browser_fallback_url")
+            if (!fallbackUrl.isNullOrBlank() &&
+                (fallbackUrl.startsWith("http://", ignoreCase = true) || fallbackUrl.startsWith("https://", ignoreCase = true))
+            ) {
+                return fallbackUrl
+            }
+        } catch (_: Throwable) {
+        }
+
+        // Regex fallback for malformed intent:// strings (e.g. intent://https://domain.com/...#Intent...)
+        val bodyBeforeHash = trimmed.substringAfter("intent://").substringBefore("#Intent")
+        val intentParams = trimmed.substringAfter("#Intent;", "")
+        if (bodyBeforeHash.startsWith("http://", ignoreCase = true) || bodyBeforeHash.startsWith("https://", ignoreCase = true)) {
+            return bodyBeforeHash
+        }
+        val schemeMatch = Regex("scheme=([a-zA-Z0-9+.-]+)").find(intentParams)?.groupValues?.getOrNull(1)?.lowercase()
+        if ((schemeMatch == "https" || schemeMatch == "http") && bodyBeforeHash.isNotBlank()) {
+            return "$schemeMatch://$bodyBeforeHash"
+        }
+        val fallbackMatch = Regex("S\\.browser_fallback_url=([^;]+)").find(intentParams)?.groupValues?.getOrNull(1)
+        if (!fallbackMatch.isNullOrBlank()) {
+            val decoded = try { java.net.URLDecoder.decode(fallbackMatch, "UTF-8") } catch (_: Throwable) { fallbackMatch }
+            if (decoded.startsWith("http://", ignoreCase = true) || decoded.startsWith("https://", ignoreCase = true)) {
+                return decoded
+            }
+        }
+    }
+
+    return null
+}
+
+private fun getPhoneNativeChromeUserAgent(context: Context): String {
+    return try {
+        val rawDefaultUa = WebSettings.getDefaultUserAgent(context) ?: ""
+        if (rawDefaultUa.isNotBlank()) {
+            rawDefaultUa
+                .replace("; wv)", ")")
+                .replace("; wv;", ";")
+                .replace("Version/4.0 ", "")
+                .trim()
+        } else {
+            val release = android.os.Build.VERSION.RELEASE ?: "14"
+            val model = android.os.Build.MODEL ?: "K"
+            "Mozilla/5.0 (Linux; Android $release; $model) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
+        }
+    } catch (_: Throwable) {
+        val release = android.os.Build.VERSION.RELEASE ?: "14"
+        val model = android.os.Build.MODEL ?: "K"
+        "Mozilla/5.0 (Linux; Android $release; $model) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
+    }
+}
+
+private fun openUrlInExternalChrome(context: Context, targetUrl: String?) {
+    val cleanUrl = targetUrl?.trim()?.takeIf { it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true) }
+        ?: "https://study-verse-lime.vercel.app/"
+    try {
+        val chromeIntent = Intent(Intent.ACTION_VIEW, Uri.parse(cleanUrl)).apply {
+            setPackage("com.android.chrome")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(chromeIntent)
+    } catch (_: Throwable) {
+        try {
+            val fallbackIntent = Intent(Intent.ACTION_VIEW, Uri.parse(cleanUrl)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(fallbackIntent)
+        } catch (e: Throwable) {
+            Toast.makeText(context, "Unable to open external browser", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
 @Composable
 fun WebViewScreen(
     url: String,
     savedState: Bundle? = null,
     initialPdfUri: Uri? = null,
     initialPdfTitle: String? = null,
+    initialWebUrl: String? = null,
     onClearIncomingPdf: () -> Unit = {},
+    onClearIncomingWebUrl: () -> Unit = {},
     onWebViewCreated: (WebView?) -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -385,15 +537,28 @@ fun WebViewScreen(
     var webBallOffsetY by remember { mutableFloatStateOf(-1f) }
     var webMenuSize by remember { mutableStateOf(IntSize.Zero) }
 
-    // Only our main StudyLime site loads in fullscreen and hides the Web Floating Ball;
+    // Fullscreen domains controllable live via Firebase Remote Config ("webview_fullscreen_domains")
+    var fullscreenDomainsCsv by remember {
+        mutableStateOf(
+            studyPrefs.getString("rc_fullscreen_domains", "study-verse-lime.vercel.app,study-verse-lime,studylime")
+                ?: "study-verse-lime.vercel.app,study-verse-lime,studylime"
+        )
+    }
+    var configRevision by remember { mutableIntStateOf(0) }
+
+    // Only our main StudyLime site (or domains listed in webview_fullscreen_domains) loads in fullscreen and hides the Web Floating Ball;
     // external websites open smoothly in standard browser mode (status + nav bar colored by site theme).
-    val isFirstStudyLimeSite = remember(currentLoadedUrl) {
+    val isFirstStudyLimeSite = remember(currentLoadedUrl, fullscreenDomainsCsv) {
         val lower = currentLoadedUrl.lowercase().trim()
-        lower.isBlank() ||
-            lower == "about:blank" ||
-            lower.contains("study-verse-lime.vercel.app") ||
-            lower.contains("study-verse-lime") ||
-            lower.contains("studylime")
+        if (lower.isBlank() || lower == "about:blank") {
+            true
+        } else {
+            val tokens = fullscreenDomainsCsv.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+            tokens.any { lower.contains(it) } ||
+                lower.contains("study-verse-lime.vercel.app") ||
+                lower.contains("study-verse-lime") ||
+                lower.contains("studylime")
+        }
     }
 
     fun syncMainFrameUrl(wv: WebView?) {
@@ -444,6 +609,19 @@ fun WebViewScreen(
             activePdfSource = path
             activePdfTitle = displayName
             onClearIncomingPdf()
+        }
+    }
+
+    // Handle incoming web deep-links (e.g., key activation redirects from external Chrome returning to StudyLime)
+    LaunchedEffect(initialWebUrl, webView) {
+        val targetWebUrl = initialWebUrl
+        val wv = webView
+        if (!targetWebUrl.isNullOrBlank() && wv != null) {
+            activePdfSource = null
+            activePdfTitle = null
+            currentLoadedUrl = targetWebUrl
+            wv.loadUrl(targetWebUrl)
+            onClearIncomingWebUrl()
         }
     }
 
@@ -543,33 +721,88 @@ fun WebViewScreen(
         }
     }
 
-    // Defer Firebase RemoteConfig & MediaSession initialization until after the initial page is interactive
-    // so they never compete with Chromium's cold-start CPU/IO during the first 25 seconds.
-    LaunchedEffect(webView, hasCompletedInitialBoot) {
-        if (webView != null && hasCompletedInitialBoot) {
-            kotlinx.coroutines.delay(12_000L)
-            try {
-                val remoteConfig = Firebase.remoteConfig
-                val configSettings = remoteConfigSettings {
-                    minimumFetchIntervalInSeconds = 3600
-                }
-                remoteConfig.setConfigSettingsAsync(configSettings)
-                remoteConfig.fetchAndActivate().addOnCompleteListener { task ->
-                    if (task.isSuccessful) {
+    // Firebase RemoteConfig Live Browser Control Engine:
+    // Applies R.xml.remote_config_defaults, fetches latest config from Firebase, and listens for real-time updates
+    // via addOnConfigUpdateListener so publishing any change in Firebase Console updates the browser immediately!
+    DisposableEffect(webView, hasCompletedInitialBoot) {
+        var configListenerRegistration: com.google.firebase.remoteconfig.ConfigUpdateListenerRegistration? = null
+        val job = if (webView != null && hasCompletedInitialBoot) {
+            coroutineScope.launch {
+                kotlinx.coroutines.delay(4_000L)
+                try {
+                    val remoteConfig = Firebase.remoteConfig
+                    val configSettings = remoteConfigSettings {
+                        minimumFetchIntervalInSeconds = 60
+                    }
+                    remoteConfig.setConfigSettingsAsync(configSettings)
+                    remoteConfig.setDefaultsAsync(R.xml.remote_config_defaults)
+
+                    fun applyRemoteConfigToPrefs() {
                         try {
-                            val wv = webView ?: return@addOnCompleteListener
-                            val customUserAgent = remoteConfig.getString("webview_user_agent")
-                            if (customUserAgent.isNotEmpty() && wv.settings.userAgentString != customUserAgent) {
-                                wv.settings.userAgentString = customUserAgent
+                            val editor = studyPrefs.edit()
+                            editor.putBoolean("rc_keep_intent_in_app", remoteConfig.getBoolean("webview_keep_intent_in_app"))
+                            editor.putBoolean("rc_block_external_redirects", remoteConfig.getBoolean("webview_block_external_redirects"))
+                            editor.putBoolean("rc_absorb_ad_popups", remoteConfig.getBoolean("webview_absorb_ad_popups"))
+                            editor.putBoolean("rc_spoof_chrome_client_hints", remoteConfig.getBoolean("webview_spoof_chrome_client_hints"))
+                            editor.putBoolean("rc_desktop_mode", remoteConfig.getBoolean("webview_desktop_mode"))
+                            editor.putBoolean("rc_zoom_enabled", remoteConfig.getBoolean("webview_zoom_enabled"))
+                            editor.putBoolean("rc_pull_to_refresh", remoteConfig.getBoolean("webview_pull_to_refresh"))
+                            editor.putBoolean("rc_js_enabled", remoteConfig.getBoolean("webview_java_script_enabled"))
+                            editor.putBoolean("rc_dom_storage", remoteConfig.getBoolean("webview_dom_storage_enabled"))
+                            editor.putBoolean("rc_third_party_cookies", remoteConfig.getBoolean("webview_third_party_cookies"))
+                            editor.putBoolean("rc_autoplay_media", remoteConfig.getBoolean("webview_autoplay_media"))
+                            editor.putBoolean("rc_hardware_accel", remoteConfig.getBoolean("webview_hardware_accel"))
+                            editor.putBoolean("rc_mixed_content", remoteConfig.getBoolean("webview_mixed_content"))
+                            val remoteUa = remoteConfig.getString("webview_user_agent").trim()
+                            val cleanRemoteUa = if (remoteUa.contains("Pixel 9 Pro Build/AP3A.241005.015")) "" else remoteUa
+                            editor.putString("rc_user_agent", cleanRemoteUa)
+                            val fsDomains = remoteConfig.getString("webview_fullscreen_domains")
+                            if (fsDomains.isNotBlank()) {
+                                editor.putString("rc_fullscreen_domains", fsDomains)
+                                fullscreenDomainsCsv = fsDomains
                             }
+                            editor.putString("rc_open_in_chrome_domains", remoteConfig.getString("webview_open_in_chrome_domains"))
+                            editor.putString("rc_blocked_ad_domains", remoteConfig.getString("webview_blocked_ad_domains"))
+                            editor.putString("rc_custom_js_inject", remoteConfig.getString("webview_custom_js_inject"))
+
+                            val remoteDomainRules = remoteConfig.getString("domain_rules")
+                            if (remoteDomainRules.isNotBlank() && remoteDomainRules.trim().startsWith("{") && remoteDomainRules.trim() != "{}") {
+                                editor.putString("domain_rules", remoteDomainRules)
+                            }
+                            editor.apply()
+                            configRevision++
                         } catch (e: Exception) {
                             e.printStackTrace()
                         }
                     }
+
+                    remoteConfig.fetchAndActivate().addOnCompleteListener { task ->
+                        if (task.isSuccessful) {
+                            applyRemoteConfigToPrefs()
+                        }
+                    }
+
+                    configListenerRegistration = remoteConfig.addOnConfigUpdateListener(object : ConfigUpdateListener {
+                        override fun onUpdate(configUpdate: ConfigUpdate) {
+                            remoteConfig.activate().addOnCompleteListener {
+                                applyRemoteConfigToPrefs()
+                            }
+                        }
+
+                        override fun onError(error: FirebaseRemoteConfigException) {
+                        }
+                    })
+                } catch (e: Exception) {
+                    e.printStackTrace()
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
             }
+        } else null
+
+        onDispose {
+            job?.cancel()
+            try {
+                configListenerRegistration?.remove()
+            } catch (_: Throwable) {}
         }
     }
 
@@ -707,9 +940,92 @@ fun WebViewScreen(
                 factory = { ctx ->
                     val density = ctx.resources.displayMetrics.density
                     val defaultLayerType = if (isEmulatorDevice) View.LAYER_TYPE_SOFTWARE else View.LAYER_TYPE_NONE
+                    val phoneNativeChromeUa = getPhoneNativeChromeUserAgent(ctx)
                     var lastAppliedSettingsKey = ""
                     var cachedRulesJsonStr = studyPrefs.getString("domain_rules", "{}") ?: "{}"
                     var cachedRulesJson = try { org.json.JSONObject(cachedRulesJsonStr) } catch (_: Throwable) { org.json.JSONObject() }
+
+                    fun extractBaseDomain(host: String): String {
+                        val parts = host.lowercase().trim().removePrefix("www.").split(".")
+                        return if (parts.size >= 2) parts.takeLast(2).joinToString(".") else host.lowercase()
+                    }
+
+                    fun isBlockedAdDomain(targetUrl: String?): Boolean {
+                        if (targetUrl.isNullOrBlank()) return false
+                        return try {
+                            val host = (android.net.Uri.parse(targetUrl).host ?: "").lowercase()
+                            if (host.isBlank()) return false
+                            val blockedCsv = studyPrefs.getString("rc_blocked_ad_domains", "") ?: ""
+                            if (blockedCsv.isBlank()) return false
+                            blockedCsv.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }.any { host.contains(it) }
+                        } catch (_: Throwable) {
+                            false
+                        }
+                    }
+
+                    fun shouldKeepIntentInAppForUrl(targetUrl: String?): Boolean {
+                        val defaultKeep = studyPrefs.getBoolean("rc_keep_intent_in_app", true) &&
+                            studyPrefs.getBoolean("rc_block_external_redirects", true)
+                        if (targetUrl.isNullOrBlank()) return defaultKeep
+                        return try {
+                            val host = android.net.Uri.parse(targetUrl).host ?: ""
+                            var keepInApp = defaultKeep
+                            if (cachedRulesJson.has("default")) {
+                                val def = cachedRulesJson.getJSONObject("default")
+                                if (def.has("keepIntentInApp")) keepInApp = def.getBoolean("keepIntentInApp")
+                            }
+                            if (cachedRulesJson.has("domains")) {
+                                val domains = cachedRulesJson.getJSONObject("domains")
+                                val keys = domains.keys()
+                                while (keys.hasNext()) {
+                                    val key = keys.next()
+                                    if (host.contains(key, ignoreCase = true)) {
+                                        val d = domains.getJSONObject(key)
+                                        if (d.has("keepIntentInApp")) keepInApp = d.getBoolean("keepIntentInApp")
+                                        break
+                                    }
+                                }
+                            }
+                            keepInApp
+                        } catch (_: Throwable) {
+                            defaultKeep
+                        }
+                    }
+
+                    fun shouldAutoOpenInExternalChrome(targetUrl: String?): Boolean {
+                        if (targetUrl.isNullOrBlank()) return false
+                        return try {
+                            val host = (android.net.Uri.parse(targetUrl).host ?: "").lowercase()
+                            val chromeDomainsCsv = studyPrefs.getString("rc_open_in_chrome_domains", "") ?: ""
+                            if (chromeDomainsCsv.isNotBlank()) {
+                                val matchesCsv = chromeDomainsCsv.split(",")
+                                    .map { it.trim().lowercase() }
+                                    .filter { it.isNotEmpty() }
+                                    .any { host.contains(it) }
+                                if (matchesCsv) return true
+                            }
+                            var openExternal = false
+                            if (cachedRulesJson.has("default")) {
+                                val def = cachedRulesJson.getJSONObject("default")
+                                if (def.has("openInChrome")) openExternal = def.getBoolean("openInChrome")
+                            }
+                            if (cachedRulesJson.has("domains")) {
+                                val domains = cachedRulesJson.getJSONObject("domains")
+                                val keys = domains.keys()
+                                while (keys.hasNext()) {
+                                    val key = keys.next()
+                                    if (host.contains(key, ignoreCase = true)) {
+                                        val d = domains.getJSONObject(key)
+                                        if (d.has("openInChrome")) openExternal = d.getBoolean("openInChrome")
+                                        break
+                                    }
+                                }
+                            }
+                            openExternal
+                        } catch (_: Throwable) {
+                            false
+                        }
+                    }
 
                     val swipeRefreshLayout = SwipeRefreshLayout(ctx).apply {
                         setColorSchemeColors(
@@ -730,20 +1046,24 @@ fun WebViewScreen(
                                 cachedRulesJson = try { org.json.JSONObject(cachedRulesJsonStr) } catch (_: Throwable) { org.json.JSONObject() }
                             }
                             val host = android.net.Uri.parse(targetUrl).host ?: ""
-                            val settingsKey = "$host|$cachedRulesJsonStr"
+                            val rcRev = studyPrefs.getString("rc_user_agent", "") ?: ""
+                            val settingsKey = "$host|$cachedRulesJsonStr|$rcRev|${studyPrefs.getBoolean("rc_desktop_mode", false)}"
 
                             val rulesJson = cachedRulesJson
                             
-                            var zoom = true
-                            var pullToRefresh = true
-                            var desktop = false
-                            var jsEnabled = true
-                            var domStorage = true
-                            var allowAutoPlay = false
-                            var hardwareAccel = true
-                            var allowMixedContent = true
+                            var zoom = studyPrefs.getBoolean("rc_zoom_enabled", true)
+                            var pullToRefresh = studyPrefs.getBoolean("rc_pull_to_refresh", true)
+                            var desktop = studyPrefs.getBoolean("rc_desktop_mode", false)
+                            var jsEnabled = studyPrefs.getBoolean("rc_js_enabled", true)
+                            var domStorage = studyPrefs.getBoolean("rc_dom_storage", true)
+                            var allowAutoPlay = studyPrefs.getBoolean("rc_autoplay_media", true)
+                            var hardwareAccel = studyPrefs.getBoolean("rc_hardware_accel", true)
+                            var allowMixedContent = studyPrefs.getBoolean("rc_mixed_content", true)
+                            var thirdPartyCookies = studyPrefs.getBoolean("rc_third_party_cookies", true)
+                            var customUaOverride: String? = studyPrefs.getString("rc_user_agent", null)
+                                ?.takeIf { it.isNotBlank() && !it.contains("Pixel 9 Pro Build/AP3A.241005.015") }
                             
-                            // Check defaults
+                            // Check defaults in domain_rules JSON
                             if (rulesJson.has("default")) {
                                 val def = rulesJson.getJSONObject("default")
                                 if (def.has("zoomEnabled")) zoom = def.getBoolean("zoomEnabled")
@@ -754,9 +1074,11 @@ fun WebViewScreen(
                                 if (def.has("allowAutoPlay")) allowAutoPlay = def.getBoolean("allowAutoPlay")
                                 if (def.has("hardwareAccel")) hardwareAccel = def.getBoolean("hardwareAccel")
                                 if (def.has("allowMixedContent")) allowMixedContent = def.getBoolean("allowMixedContent")
+                                if (def.has("thirdPartyCookies")) thirdPartyCookies = def.getBoolean("thirdPartyCookies")
+                                if (def.has("userAgent")) customUaOverride = def.getString("userAgent").takeIf { it.isNotBlank() }
                             }
                             
-                            // Check specific domains
+                            // Check specific domains in domain_rules JSON
                             if (rulesJson.has("domains")) {
                                 val domains = rulesJson.getJSONObject("domains")
                                 val keys = domains.keys()
@@ -772,6 +1094,8 @@ fun WebViewScreen(
                                         if (domainRules.has("allowAutoPlay")) allowAutoPlay = domainRules.getBoolean("allowAutoPlay")
                                         if (domainRules.has("hardwareAccel")) hardwareAccel = domainRules.getBoolean("hardwareAccel")
                                         if (domainRules.has("allowMixedContent")) allowMixedContent = domainRules.getBoolean("allowMixedContent")
+                                        if (domainRules.has("thirdPartyCookies")) thirdPartyCookies = domainRules.getBoolean("thirdPartyCookies")
+                                        if (domainRules.has("userAgent")) customUaOverride = domainRules.getString("userAgent").takeIf { it.isNotBlank() }
                                         break
                                     }
                                 }
@@ -800,6 +1124,7 @@ fun WebViewScreen(
                             if (webView.settings.domStorageEnabled != domStorage) {
                                 webView.settings.domStorageEnabled = domStorage
                             }
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(webView, thirdPartyCookies)
                             val reqGesture = !allowAutoPlay
                             if (webView.settings.mediaPlaybackRequiresUserGesture != reqGesture) {
                                 webView.settings.mediaPlaybackRequiresUserGesture = reqGesture
@@ -819,9 +1144,9 @@ fun WebViewScreen(
                             }
                             
                             val desiredUa = if (desktop) {
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
                             } else {
-                                "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                                customUaOverride ?: phoneNativeChromeUa
                             }
                             if (webView.settings.userAgentString != desiredUa) {
                                 webView.settings.userAgentString = desiredUa
@@ -964,7 +1289,7 @@ fun WebViewScreen(
                             allowContentAccess = true
                             setGeolocationEnabled(true)
 
-                            userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                            userAgentString = phoneNativeChromeUa
 
                             // High-speed caching & smooth scrolling optimization: fallback to cache when offline
                             cacheMode = if (isOnline) WebSettings.LOAD_DEFAULT else WebSettings.LOAD_CACHE_ELSE_NETWORK
@@ -1118,30 +1443,79 @@ fun WebViewScreen(
                                     setGeolocationEnabled(true)
                                     cacheMode = WebSettings.LOAD_DEFAULT
                                     loadsImagesAutomatically = true
-                                    userAgentString = "Mozilla/5.0 (Linux; Android 16; Pixel 9 Pro Build/AP3A.241005.015) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+                                    userAgentString = phoneNativeChromeUa
                                 }
                                 newWebView.webChromeClient = this
                                 newWebView.webViewClient = object : WebViewClient() {
+                                    private var popupHandled = false
                                     private fun handlePopupUrl(v: WebView?, targetUrl: String): Boolean {
-                                        val isDoc = isDirectStudyDocumentUrl(targetUrl)
+                                        if (popupHandled) return true
+                                        popupHandled = true
+                                        val unwrappedWebUrl = resolveWebUrlFromIntentOrCustomScheme(targetUrl)
+                                        val effectiveUrl = unwrappedWebUrl ?: targetUrl
+                                        if (isBlockedAdDomain(effectiveUrl)) {
+                                            try {
+                                                v?.stopLoading()
+                                                v?.destroy()
+                                            } catch (_: Throwable) {}
+                                            return true
+                                        }
+
+                                        val isDoc = isDirectStudyDocumentUrl(effectiveUrl)
                                         if (isDoc) {
                                             (ctx as? Activity)?.runOnUiThread {
                                                 if (activePdfSource == null) {
-                                                    activePdfSource = targetUrl
+                                                    activePdfSource = effectiveUrl
                                                     activePdfTitle = URLUtil.guessFileName(
-                                                        targetUrl,
+                                                        effectiveUrl,
                                                         null,
-                                                        if (targetUrl.contains(".doc")) "application/msword" else "application/pdf"
+                                                        if (effectiveUrl.contains(".doc")) "application/msword" else "application/pdf"
                                                     )
                                                 }
                                             }
                                             syncMainFrameUrl(view)
-                                        } else {
+                                        } else if (effectiveUrl.startsWith("http://", ignoreCase = true) || effectiveUrl.startsWith("https://", ignoreCase = true)) {
+                                            val mainUrl = view.url ?: currentLoadedUrl
+                                            val mainHost = android.net.Uri.parse(mainUrl).host ?: ""
+                                            val popupHost = android.net.Uri.parse(effectiveUrl).host ?: ""
+                                            val isFromStudyLime = mainHost.contains("study-verse-lime", ignoreCase = true) ||
+                                                mainHost.contains("studylime", ignoreCase = true)
+                                            val isToStudyLime = popupHost.contains("study-verse-lime", ignoreCase = true) ||
+                                                popupHost.contains("studylime", ignoreCase = true)
+                                            val isSameBaseDomain = extractBaseDomain(mainHost).isNotEmpty() &&
+                                                extractBaseDomain(mainHost) == extractBaseDomain(popupHost)
+                                            val absorbAdPopups = studyPrefs.getBoolean("rc_absorb_ad_popups", false)
+
                                             if (activePdfSource == null) {
-                                                // Do NOT prematurely overwrite currentLoadedUrl before view commits the new page;
-                                                // if targetUrl is a download or external intent, StudyLime remains in fullscreen.
-                                                view.loadUrl(targetUrl)
+                                                if (isUserGesture || isFromStudyLime || isToStudyLime || isSameBaseDomain || !absorbAdPopups) {
+                                                    // Load inside the phone's WebView with Referer preserved so multi-domain key generation steps pass seamlessly!
+                                                    val headers = if (mainUrl.startsWith("http", ignoreCase = true)) {
+                                                        mapOf("Referer" to mainUrl)
+                                                    } else emptyMap()
+                                                    view.loadUrl(effectiveUrl, headers)
+                                                } else {
+                                                    v?.postDelayed({
+                                                        try {
+                                                            v.stopLoading()
+                                                            v.destroy()
+                                                        } catch (_: Throwable) {}
+                                                    }, 1200L)
+                                                    return false
+                                                }
                                             }
+                                        } else {
+                                            // Non-web native app scheme (e.g. tg://, whatsapp://, upi://)
+                                            try {
+                                                val nativeIntent = if (effectiveUrl.startsWith("intent://", ignoreCase = true)) {
+                                                    Intent.parseUri(effectiveUrl, Intent.URI_INTENT_SCHEME)
+                                                } else {
+                                                    Intent(Intent.ACTION_VIEW, Uri.parse(effectiveUrl))
+                                                }
+                                                nativeIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                ctx.startActivity(nativeIntent)
+                                            } catch (_: Throwable) {
+                                            }
+                                            syncMainFrameUrl(view)
                                         }
                                         try {
                                             v?.stopLoading()
@@ -1159,6 +1533,13 @@ fun WebViewScreen(
                                     override fun shouldOverrideUrlLoading(v: WebView?, urlStr: String?): Boolean {
                                         val targetUrl = urlStr ?: return false
                                         return handlePopupUrl(v, targetUrl)
+                                    }
+
+                                    override fun onPageStarted(v: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                                        super.onPageStarted(v, url, favicon)
+                                        if (!url.isNullOrBlank() && url != "about:blank") {
+                                            handlePopupUrl(v, url)
+                                        }
                                     }
 
                                     override fun onRenderProcessGone(v: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
@@ -1217,19 +1598,57 @@ fun WebViewScreen(
                                 handler?.proceed()
                             }
 
-                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                                val requestUrl = request?.url?.toString() ?: return false
+                            private fun handleCustomOrNavigationUrl(view: WebView?, rawRequestUrl: String): Boolean {
                                 if (activePdfSource != null) {
                                     return true
                                 }
+                                if (isBlockedAdDomain(rawRequestUrl)) {
+                                    return true
+                                }
 
-                                val isDocument = isDirectStudyDocumentUrl(requestUrl)
+                                // 1. Unwrap Chrome redirect intents (intent://...#Intent;scheme=https;package=com.android.chrome;end)
+                                // and googlechrome:// schemes so ad-key generation stays 100% inside the app's WebView (unless remotely disabled via keepIntentInApp: false)!
+                                val unwrappedWebUrl = resolveWebUrlFromIntentOrCustomScheme(rawRequestUrl)
+                                if (unwrappedWebUrl != null && shouldKeepIntentInAppForUrl(unwrappedWebUrl)) {
+                                    if (isDirectStudyDocumentUrl(unwrappedWebUrl)) {
+                                        val guessName = URLUtil.guessFileName(
+                                            unwrappedWebUrl,
+                                            null,
+                                            if (unwrappedWebUrl.contains(".doc")) "application/msword" else "application/pdf"
+                                        )
+                                        (ctx as? Activity)?.runOnUiThread {
+                                            if (activePdfSource == null) {
+                                                activePdfSource = unwrappedWebUrl
+                                                activePdfTitle = guessName
+                                            }
+                                        }
+                                        view?.stopLoading()
+                                        syncMainFrameUrl(view)
+                                        return true
+                                    }
+                                    if (shouldAutoOpenInExternalChrome(unwrappedWebUrl)) {
+                                        openUrlInExternalChrome(ctx, unwrappedWebUrl)
+                                        syncMainFrameUrl(view)
+                                        return true
+                                    }
+                                    val currentRef = view?.url ?: currentLoadedUrl
+                                    val headers = if (currentRef.startsWith("http", ignoreCase = true)) {
+                                        mapOf("Referer" to currentRef)
+                                    } else emptyMap()
+                                    view?.loadUrl(unwrappedWebUrl, headers)
+                                    return true
+                                }
 
-                                if (isDocument) {
-                                    val guessName = URLUtil.guessFileName(requestUrl, null, if (requestUrl.contains(".doc")) "application/msword" else "application/pdf")
+                                // 2. Check direct PDF / Office document links
+                                if (isDirectStudyDocumentUrl(rawRequestUrl)) {
+                                    val guessName = URLUtil.guessFileName(
+                                        rawRequestUrl,
+                                        null,
+                                        if (rawRequestUrl.contains(".doc")) "application/msword" else "application/pdf"
+                                    )
                                     (ctx as? Activity)?.runOnUiThread {
                                         if (activePdfSource == null) {
-                                            activePdfSource = requestUrl
+                                            activePdfSource = rawRequestUrl
                                             activePdfTitle = guessName
                                         }
                                     }
@@ -1238,29 +1657,41 @@ fun WebViewScreen(
                                     return true
                                 }
 
-                                if (requestUrl.startsWith("http://") || requestUrl.startsWith("https://")) {
-                                    return false // Let WebView handle it; currentLoadedUrl updates in onPageCommitVisible / doUpdateVisitedHistory
+                                // 3. Standard HTTP / HTTPS web navigation stays inside WebView (unless domain is remotely configured with openInChrome: true)
+                                if (rawRequestUrl.startsWith("http://", ignoreCase = true) || rawRequestUrl.startsWith("https://", ignoreCase = true)) {
+                                    if (shouldAutoOpenInExternalChrome(rawRequestUrl)) {
+                                        openUrlInExternalChrome(ctx, rawRequestUrl)
+                                        syncMainFrameUrl(view)
+                                        return true
+                                    }
+                                    return false
                                 }
+
+                                // 4. True external app intents (Telegram tg://, WhatsApp whatsapp://, UPI, Play Store, etc.)
                                 try {
-                                    val intent = if (requestUrl.startsWith("intent://")) {
-                                        android.content.Intent.parseUri(requestUrl, android.content.Intent.URI_INTENT_SCHEME)
+                                    val intent = if (rawRequestUrl.startsWith("intent://", ignoreCase = true)) {
+                                        android.content.Intent.parseUri(rawRequestUrl, android.content.Intent.URI_INTENT_SCHEME)
                                     } else {
-                                        android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(requestUrl))
+                                        android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(rawRequestUrl))
                                     }
                                     intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                                     ctx.startActivity(intent)
                                 } catch (e: Exception) {
-                                    if (requestUrl.startsWith("intent://")) {
+                                    if (rawRequestUrl.startsWith("intent://", ignoreCase = true)) {
                                         try {
-                                            val parsedIntent = android.content.Intent.parseUri(requestUrl, android.content.Intent.URI_INTENT_SCHEME)
+                                            val parsedIntent = android.content.Intent.parseUri(rawRequestUrl, android.content.Intent.URI_INTENT_SCHEME)
                                             val fallbackUrl = parsedIntent.getStringExtra("browser_fallback_url")
+                                                ?: parsedIntent.getStringExtra("S.browser_fallback_url")
                                             if (fallbackUrl != null) {
                                                 view?.loadUrl(fallbackUrl)
                                                 return true
                                             }
                                             val packageName = parsedIntent.`package`
-                                            if (packageName != null) {
-                                                val playStoreIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("market://details?id=$packageName"))
+                                            if (packageName != null && packageName != "com.android.chrome") {
+                                                val playStoreIntent = android.content.Intent(
+                                                    android.content.Intent.ACTION_VIEW,
+                                                    android.net.Uri.parse("market://details?id=$packageName")
+                                                )
                                                 playStoreIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                                                 ctx.startActivity(playStoreIntent)
                                                 return true
@@ -1275,63 +1706,15 @@ fun WebViewScreen(
                                 return true
                             }
 
+                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                val requestUrl = request?.url?.toString() ?: return false
+                                return handleCustomOrNavigationUrl(view, requestUrl)
+                            }
+
                             @Suppress("DEPRECATION")
                             override fun shouldOverrideUrlLoading(view: WebView?, urlStr: String?): Boolean {
                                 if (urlStr == null) return false
-                                if (activePdfSource != null) {
-                                    return true
-                                }
-
-                                val isDocStr = isDirectStudyDocumentUrl(urlStr)
-
-                                if (isDocStr) {
-                                    val guessName = URLUtil.guessFileName(urlStr, null, if (urlStr.contains(".doc")) "application/msword" else "application/pdf")
-                                    (ctx as? Activity)?.runOnUiThread {
-                                        if (activePdfSource == null) {
-                                            activePdfSource = urlStr
-                                            activePdfTitle = guessName
-                                        }
-                                    }
-                                    view?.stopLoading()
-                                    syncMainFrameUrl(view)
-                                    return true
-                                }
-
-                                if (urlStr.startsWith("http://") || urlStr.startsWith("https://")) {
-                                    return false // Let WebView handle it normally
-                                }
-                                try {
-                                    val intent = if (urlStr.startsWith("intent://")) {
-                                        android.content.Intent.parseUri(urlStr, android.content.Intent.URI_INTENT_SCHEME)
-                                    } else {
-                                        android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(urlStr))
-                                    }
-                                    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    ctx.startActivity(intent)
-                                } catch (e: Exception) {
-                                    if (urlStr.startsWith("intent://")) {
-                                        try {
-                                            val parsedIntent = android.content.Intent.parseUri(urlStr, android.content.Intent.URI_INTENT_SCHEME)
-                                            val fallbackUrl = parsedIntent.getStringExtra("browser_fallback_url")
-                                            if (fallbackUrl != null) {
-                                                view?.loadUrl(fallbackUrl)
-                                                return true
-                                            }
-                                            val packageName = parsedIntent.`package`
-                                            if (packageName != null) {
-                                                val playStoreIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("market://details?id=$packageName"))
-                                                playStoreIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                                ctx.startActivity(playStoreIntent)
-                                                return true
-                                            }
-                                        } catch (ex: Exception) {
-                                            ex.printStackTrace()
-                                        }
-                                    }
-                                    e.printStackTrace()
-                                }
-                                syncMainFrameUrl(view)
-                                return true
+                                return handleCustomOrNavigationUrl(view, urlStr)
                             }
 
                             override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
@@ -1470,9 +1853,81 @@ fun WebViewScreen(
                             }
 
                             private fun installScrollAndSafetyGuard(view: WebView?) {
-                                // Lightweight one-time fast-tap CSS & chunk-recovery listener (no JS scroll listener overhead)
+                                val spoofChrome = studyPrefs.getBoolean("rc_spoof_chrome_client_hints", true)
+                                val customJs = studyPrefs.getString("rc_custom_js_inject", "") ?: ""
+                                val realModel = (android.os.Build.MODEL ?: "Android").replace("'", "").replace("\"", "")
+                                val realRelease = (android.os.Build.VERSION.RELEASE ?: "14.0.0").replace("'", "").replace("\"", "")
+                                // Uses the phone's real Chromium version, real Android release, and real device model
+                                // while reporting Google Chrome brands + keeping target="_blank" forms/links inside the phone's native WebView!
                                 val safetyGuardScript = """
                                     (function() {
+                                        try {
+                                            if ($spoofChrome) {
+                                                if (!window.chrome) {
+                                                    window.chrome = {};
+                                                }
+                                                if (!window.chrome.runtime) window.chrome.runtime = {};
+                                                if (!window.chrome.app) window.chrome.app = { isInstalled: false };
+                                                if (!window.chrome.csi) window.chrome.csi = function() { return {}; };
+                                                if (!window.chrome.loadTimes) window.chrome.loadTimes = function() { return {}; };
+                                                if (navigator.webdriver) {
+                                                    Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
+                                                }
+                                                var ua = navigator.userAgent || '';
+                                                var m = ua.match(/Chrome\/(([0-9]+)\.[0-9]+\.[0-9]+\.[0-9]+)/);
+                                                var fullVer = m ? m[1] : '134.0.0.0';
+                                                var majorVer = m ? m[2] : '134';
+                                                var chromeBrands = [
+                                                    { brand: 'Google Chrome', version: majorVer },
+                                                    { brand: 'Chromium', version: majorVer },
+                                                    { brand: 'Not-A.Brand', version: '24' }
+                                                ];
+                                                var uaData = {
+                                                    brands: chromeBrands,
+                                                    mobile: true,
+                                                    platform: 'Android',
+                                                    getHighEntropyValues: function(hints) {
+                                                        return Promise.resolve({
+                                                            brands: chromeBrands,
+                                                            fullVersionList: [
+                                                                { brand: 'Google Chrome', version: fullVer },
+                                                                { brand: 'Chromium', version: fullVer },
+                                                                { brand: 'Not-A.Brand', version: '24.0.0.0' }
+                                                            ],
+                                                            mobile: true,
+                                                            model: '$realModel',
+                                                            platform: 'Android',
+                                                            platformVersion: '$realRelease',
+                                                            architecture: 'arm',
+                                                            bitness: '64',
+                                                            uaFullVersion: fullVer
+                                                        });
+                                                    },
+                                                    toJSON: function() {
+                                                        return { brands: chromeBrands, mobile: true, platform: 'Android' };
+                                                    }
+                                                };
+                                                Object.defineProperty(navigator, 'userAgentData', {
+                                                    get: function() { return uaData; },
+                                                    configurable: true
+                                                });
+                                            }
+                                            if (!window.__studyverse_native_target_guard) {
+                                                window.__studyverse_native_target_guard = true;
+                                                document.addEventListener('click', function(e) {
+                                                    var el = e.target && e.target.closest ? e.target.closest('a[target="_blank"], form[target="_blank"]') : null;
+                                                    if (el && el.getAttribute('target') === '_blank') {
+                                                        el.setAttribute('target', '_self');
+                                                    }
+                                                }, true);
+                                                document.addEventListener('submit', function(e) {
+                                                    var form = e.target;
+                                                    if (form && form.getAttribute && form.getAttribute('target') === '_blank') {
+                                                        form.setAttribute('target', '_self');
+                                                    }
+                                                }, true);
+                                            }
+                                        } catch (e) {}
                                         if (!document.getElementById('__studyverse_fast_tap') && document.head) {
                                             var st = document.createElement('style');
                                             st.id = '__studyverse_fast_tap';
@@ -1504,6 +1959,9 @@ fun WebViewScreen(
                                     })();
                                 """.trimIndent()
                                 view?.evaluateJavascript(safetyGuardScript, null)
+                                if (customJs.isNotBlank()) {
+                                    view?.evaluateJavascript(customJs, null)
+                                }
                             }
 
                             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -1515,6 +1973,7 @@ fun WebViewScreen(
                                 view?.let { webView ->
                                     applyDynamicSettings(webView.url ?: url, webView)
                                 }
+                                installScrollAndSafetyGuard(view)
                             }
 
                             override fun onPageCommitVisible(view: WebView?, url: String?) {
@@ -1526,7 +1985,11 @@ fun WebViewScreen(
                                     isLoading = false
                                 }
                                 syncMainFrameUrl(view)
+                                installScrollAndSafetyGuard(view)
                                 extractAndPostThemeColor(view)
+                                try {
+                                    CookieManager.getInstance().flush()
+                                } catch (_: Throwable) {}
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
@@ -1541,6 +2004,9 @@ fun WebViewScreen(
                                 syncMainFrameUrl(view)
                                 installScrollAndSafetyGuard(view)
                                 extractAndPostThemeColor(view)
+                                try {
+                                    CookieManager.getInstance().flush()
+                                } catch (_: Throwable) {}
 
                                 // Safe blank body check strictly for StudyLime main site after full hydration (3.5s)
                                 view?.postDelayed({
@@ -3055,7 +3521,7 @@ fun WebFloatingBallChromeMenu(
                     }
                 }
 
-                // 3. Compact 3-Column Chrome Quick Actions Row (Back, Forward, Scroll Top — no PDF column)
+                // 3. Compact 3-Column Chrome Quick Actions Row (Back, Forward, Top)
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
@@ -3080,7 +3546,7 @@ fun WebFloatingBallChromeMenu(
 
                     WebQuickActionItem(
                         icon = Icons.Default.KeyboardArrowUp,
-                        label = "Scroll Top",
+                        label = "Top",
                         enabled = true,
                         accentColor = Color(0xFF34D399),
                         onClick = onScrollToTop,

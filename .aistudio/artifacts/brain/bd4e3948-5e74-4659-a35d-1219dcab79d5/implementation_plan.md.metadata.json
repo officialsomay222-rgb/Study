@@ -1,6 +1,6 @@
 {
-  "summary": "Updated implementation plan reflecting user preference: removed server-driven UI to keep the app cleanly focused on opening the study website, while implementing the upward scroll fix, SwipeRefresh resistance, zero-allocation buttery animations, and WebView performance enhancements.",
-  "updatedAt": "2026-10-12T13:32:36.980032995Z",
-  "requestFeedback": true,
-  "userFacing": true
+  "summary":  "Implementation plan for keeping ad-key generation and HTTPS intent redirects inside the in-app WebView, spoofing Chrome browser signals so shorteners do not block WebView, catching StudyLime activation callbacks via Android deep links, and adding an Open in Chrome button to the movable Web Browsing Ball menu.",
+  "updatedAt":  "2026-11-09T02:07:55.328189401Z",
+  "requestFeedback":  true,
+  "userFacing":  true
 }

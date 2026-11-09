@@ -37,7 +37,23 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 
-                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.action.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Deep-link receiver for StudyLime so key activation callbacks from external browsers return directly into the app -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="study-verse-lime.vercel.app" />
+                <data android:scheme="http" android:host="study-verse-lime.vercel.app" />
+            </intent-filter>
+
+            <!-- Allow sharing any study or key-activation link directly from Chrome ("Share -> StudyVerse") into the app WebView -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
             </intent-filter>
 
             <!-- Register as default/optional system PDF viewer for all file managers, browsers, and phone apps -->
